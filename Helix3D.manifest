@@ -1,0 +1,13 @@
+{
+    "autodeskProduct": "Fusion",
+    "type": "addin",
+    "id": "e38cea06-648e-4a3d-aac2-e6085495807c",
+    "author": "Scott Moyse",
+    "description": {
+        "": "Parametric 3D helix sketch curve as a custom feature"
+    },
+    "version": "0.6.0",
+    "runOnStartup": true,
+    "supportedOS": "windows|mac",
+    "editEnabled": true
+}
