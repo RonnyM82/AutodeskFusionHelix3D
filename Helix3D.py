@@ -869,7 +869,7 @@ def _add_var_inputs(inputs, spec=None, context='create', sketch=None):
     stations = spec.get('stations') or _default_stations()
     n = max(2, min(MAX_STATIONS, len(stations)))
 
-    pos = inputs.addGroupCommandInput('position_grp', 'Position')
+    pos = inputs.addGroupCommandInput('position_grp', 'Position (optional)')
     pos.isExpanded = True
     pos.tooltip = 'Where the helix sits. Pick nothing and it starts at the origin of the sketch plane.'
     _add_pickers(pos.children, spec, context, with_path=False,
@@ -881,8 +881,9 @@ def _add_var_inputs(inputs, spec=None, context='create', sketch=None):
     grp.isExpanded = True
     grp.tooltip = ('Station 1 is where the helix starts. Each row after it says how many '
                    'turns on from the row above it sits, and the pitch and radius there. '
-                   'Click into a row and a cross marks its station on the preview, with '
-                   'the run its turns value measures lit up behind it.')
+                   'Click into a row and a cross marks its station on the preview, the run '
+                   'its turns value measures lights up, and a note says what that row is '
+                   'doing to the helix.')
     ch = grp.children
     cnt = ch.addIntegerSpinnerCommandInput('stations', 'Stations', 2, MAX_STATIONS, 1, n)
     cnt.isEnabled = context != 'edit_feature'   # a feature's parameters are fixed
@@ -1061,6 +1062,29 @@ def _helix_point(spec, u):
     return adsk.core.Point3D.create(*(P[-1] if tail else P[0]))
 
 
+def _point_at(spec, u, out=0.0):
+    """_helix_point with the helix's own placement applied. `out` pushes the
+    point that much further from the axis, to sit a label clear of the coil."""
+    p = _helix_point(spec, u)
+    if out:
+        r = math.hypot(p.x, p.y)
+        if r > 1e-9:
+            k = 1.0 + out / r
+            p = adsk.core.Point3D.create(p.x * k, p.y * k, p.z)
+    xf = spec.get('xform')
+    if xf:
+        M = adsk.core.Matrix3D.create()
+        M.setWithArray(xf)
+        p.transformBy(M)
+    return p
+
+
+def _focus_size(spec):
+    """Marker and text sized off the helix, so they stay in proportion."""
+    r = max([st.get('radius', 0.0) for st in spec['stations']] or [1.0])
+    return max(r * 0.30, 0.25), max(r * 0.13, 0.12)     # cross arm, text height
+
+
 def _build_highlight(spec):
     """The highlighted stretch as a curve in sketch space, or None."""
     rng = _var_focus_range(spec)
@@ -1077,14 +1101,40 @@ def _build_marker(spec):
     u = _var_focus_station(spec)
     if u is None:
         return None
-    p = _helix_point(spec, u)
-    xf = spec.get('xform')
-    if xf:
-        M = adsk.core.Matrix3D.create()
-        M.setWithArray(xf)
-        p.transformBy(M)
-    r = max([st.get('radius', 0.0) for st in spec['stations']] or [1.0])
-    return p, max(r * 0.16, 0.05)
+    return _point_at(spec, u), _focus_size(spec)[0]
+
+
+def _focus_label(spec):
+    """(text, anchor in sketch space, height): what the row is doing to the
+    helix, written out on the canvas the way a dimension would be."""
+    if not _var_focus or spec.get('mode') != MODE_VAR:
+        return None
+    n = len(spec['stations'])
+    kind = _var_focus[0]
+    k = _var_focus[1] if kind == 'row' else (1 if kind == 'start' else n)
+    if not 1 <= k <= n:
+        return None
+    um = app.activeProduct.unitsManager
+    lu = um.defaultLengthUnits
+    length = lambda v: um.formatInternalValue(v, lu, True)
+    turns = lambda v: um.formatInternalValue(v, '', False)
+    st = spec['stations'][k - 1]
+    rng = _var_focus_range(spec)
+    if rng:
+        sts = _expanded_stations(spec)
+        xs, ps, _ = _station_axes(sts)
+        ramp = _Ramp(xs, ps, spec.get('blend', 'smooth') == 'smooth')
+        rise = ramp.integral(rng[1]) - ramp.integral(rng[0])
+        head = '%s turns on, rising %s' % (turns(rng[1] - rng[0]), length(rise))
+        u = (rng[0] + rng[1]) / 2.0
+    else:
+        head = 'where the helix starts'
+        u = _var_focus_station(spec)
+    # Three short lines read better on a billboard than two long ones.
+    text = 'Station %d\n%s\npitch %s, radius %s' % (
+        k, head, length(st.get('pitch', 0.0)), length(st.get('radius', 0.0)))
+    r = max([t.get('radius', 0.0) for t in spec['stations']] or [1.0])
+    return text, _point_at(spec, u, r * 0.45), _focus_size(spec)[1]
 
 
 ORANGE = (255, 140, 0)
@@ -1092,20 +1142,24 @@ ORANGE = (255, 140, 0)
 
 def _show_highlight(spec, comp, xf):
     """Overlay on the part of the helix the dialog is on: the run the row's
-    turns value measures, and a cross on the row's own station. Lives in the
-    preview transaction with everything else, so it goes when the dialog does."""
+    turns value measures, a cross on the row's own station, and a note saying
+    what that row is doing. Lives in the preview transaction with everything
+    else, so it goes when the dialog does."""
     try:
         curve = _build_highlight(spec)
         mark = _build_marker(spec)
+        label = _focus_label(spec)
     except HelixError:
         return
-    if curve is None and mark is None:
+    if curve is None and mark is None and label is None:
         return
     g = comp.customGraphicsGroups.add()
     paint = adsk.fusion.CustomGraphicsSolidColorEffect.create(adsk.core.Color.create(*(ORANGE + (255,))))
 
     def draw(geom, weight):
         e = g.addCurve(geom)
+        if not e:
+            return
         e.weight = weight
         e.color = paint
         try:
@@ -1123,6 +1177,26 @@ def _show_highlight(spec, comp, xf):
             draw(adsk.core.Line3D.create(
                 adsk.core.Point3D.create(p.x - dx, p.y - dy, p.z - dz),
                 adsk.core.Point3D.create(p.x + dx, p.y + dy, p.z + dz)), 3)
+    if label is not None:
+        text, p, height = label
+        p.transformBy(xf)
+        M = adsk.core.Matrix3D.create()
+        M.translation = adsk.core.Vector3D.create(p.x, p.y, p.z)
+        t = g.addText(text, 'Arial', height, M)
+        if t:
+            t.color = paint
+            try:
+                # Face the screen, so it stays readable whichever way the model
+                # is spun. Without this the note lies flat on the XY plane.
+                bb = adsk.fusion.CustomGraphicsBillBoard.create(p)
+                bb.billBoardStyle = adsk.fusion.CustomGraphicsBillBoardStyles.ScreenBillBoardStyle
+                t.billBoarding = bb
+            except Exception:
+                _log('Helix3D label billboard failed:\n' + traceback.format_exc())
+            try:
+                t.depthPriority = 1
+            except Exception:
+                pass
 
 
 class VarPoll(adsk.core.CustomEventHandler):
@@ -1178,74 +1252,6 @@ def _selected_row(inputs):
     overwritten by the row watcher a moment later."""
     table = adsk.core.TableCommandInput.cast(_find(inputs, 'table'))
     return table.selectedRow if table else -2
-
-
-class VarPoll(adsk.core.CustomEventHandler):
-    """Fusion fires nothing when a table row is clicked, only when a value
-    changes. A thread ticks this event while the dialog is open; here, on the
-    main thread, the selected row is compared with the last one seen and the
-    preview is redrawn when it has moved."""
-    def notify(self, args):
-        global _var_last_row, _var_focus
-        try:
-            cmd = _var_cmd
-            if cmd is None or not cmd.isValid:
-                return
-            table = adsk.core.TableCommandInput.cast(_find(cmd.commandInputs, 'table'))
-            if not table:
-                return
-            row = table.selectedRow
-            if row == _var_last_row:
-                return
-            _var_last_row = row
-            if row >= 1:
-                _var_focus = ('row', row)
-                cmd.doExecutePreview()
-        except Exception:
-            _log('Helix3D row watch failed:\n' + traceback.format_exc())
-
-
-def _start_var_poll(cmd):
-    global _var_cmd, _var_poll_stop, _var_last_row
-    _stop_var_poll()
-    _var_cmd, _var_last_row = cmd, -2
-    stop = threading.Event()
-    _var_poll_stop = stop
-
-    def tick():
-        while not stop.wait(0.15):
-            try:
-                app.fireCustomEvent(VAR_POLL_EVT)
-            except Exception:
-                break
-    threading.Thread(target=tick, daemon=True).start()
-
-
-def _stop_var_poll():
-    global _var_cmd, _var_poll_stop
-    if _var_poll_stop is not None:
-        _var_poll_stop.set()
-    _var_cmd, _var_poll_stop = None, None
-
-
-def _show_highlight(spec, comp, xf):
-    """Orange overlay on the part of the helix the dialog is on. Lives in the
-    preview transaction with everything else, so it goes when the dialog does."""
-    try:
-        curve = _build_highlight(spec)
-    except HelixError:
-        return
-    if curve is None:
-        return
-    curve.transformBy(xf)
-    g = comp.customGraphicsGroups.add()
-    c = g.addCurve(curve)
-    c.weight = 5
-    c.color = adsk.fusion.CustomGraphicsSolidColorEffect.create(adsk.core.Color.create(255, 140, 0, 255))
-    try:
-        c.depthPriority = 1     # over the curve it sits on
-    except Exception:
-        pass
 
 
 def _end_type(inputs, side):
