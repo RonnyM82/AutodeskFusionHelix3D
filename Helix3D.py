@@ -388,9 +388,9 @@ def _add_inputs(inputs, spec=None, context='create', sketch=None):
     in-sketch helix lives in (enables the placement triad)."""
     global _pending_selections, _seeded_end_radius
     _pending_selections = []
-    _seeded_end_radius = 'endRadius' in spec   # an existing end radius must not be overwritten
     lu = app.activeProduct.unitsManager.defaultLengthUnits
     spec = spec or {}
+    _seeded_end_radius = 'endRadius' in spec   # an existing end radius must not be overwritten
     v = lambda k, d: adsk.core.ValueInput.createByReal(spec.get(k, d))
 
     dd = inputs.addDropDownCommandInput('mode', 'Mode', adsk.core.DropDownStyles.TextListDropDownStyle)
