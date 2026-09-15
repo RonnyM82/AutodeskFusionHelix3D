@@ -940,6 +940,8 @@ class InputChanged(adsk.core.InputChangedEventHandler):
                 er.expression = adsk.core.ValueCommandInput.cast(args.inputs.itemById('radius')).expression
             if args.input.id in ('mode', 'center', 'start', 'path', 'taperBy'):
                 _apply_mode_visibility(args.inputs)
+            if args.input.id == 'mode':
+                _focus_first_empty_picker(args.inputs)   # the pickers just changed
             _advance_focus(args.inputs, args.input.id)
         except Exception:
             _log('Helix3D inputChanged failed:\n' + traceback.format_exc())
@@ -948,6 +950,23 @@ class InputChanged(adsk.core.InputChangedEventHandler):
 def _picked(inputs, sid):
     sel = adsk.core.SelectionCommandInput.cast(inputs.itemById(sid))
     return sel.selection(0).entity if sel and sel.selectionCount else None
+
+
+def _focus_first_empty_picker(inputs):
+    """Hiding a picker that holds selection focus leaves focus on the hidden
+    input, so the one that just appeared looks disabled until it is clicked.
+    Hand focus to the first visible picker that still needs something."""
+    visible = []
+    for sid in PICKERS:
+        p = inputs.itemById(sid)
+        if p and p.isVisible:
+            visible.append(adsk.core.SelectionCommandInput.cast(p))
+    if not visible or any(p.hasFocus for p in visible):
+        return
+    for p in visible:
+        if p.selectionCount == 0:
+            p.hasFocus = True
+            return
 
 
 def _advance_focus(inputs, changed_id):
@@ -1246,6 +1265,7 @@ def _reselect_pending(inputs):
         _log('Helix3D activate: reselect %s (%s) -> %s, picker now holds %d'
              % (sid, _describe(ent), ok, sel.selectionCount if sel else -1))
     _apply_mode_visibility(inputs)   # radius/start angle hide when a start point is set
+    _focus_first_empty_picker(inputs)
 
 
 class EditPreSelect(adsk.core.SelectionEventHandler):
