@@ -155,6 +155,9 @@ def helix(d, stations, box, smooth=True, lit=None, marks=(), numbered=False,
     run(0.0, total, BLUE, BLUE_FAR, 1.7)
     if lit:
         run(lit[0], lit[1], ORANGE, ORANGE_EDGE, 2.6)
+    at.cx, at.total = cx, total
+    at.edge = lambda u, side: (cx + side * radius.value(u) / rmax * R,
+                               cy - pitch.integral(u) / rmax * R)
     for i, u in enumerate(marks):
         p = at(u)
         dot(d, p, 2.6, GROUND, ORANGE, 1.3)
@@ -296,7 +299,71 @@ def clip_stations():
     return img
 
 
-CLIPS = (('pitch-rise.png', clip_pitch), ('turns.png', clip_turns),
+def clip_taper():
+    """For the other command: a helix that opens out as it climbs."""
+    img, d = canvas()
+    text(d, (W / 2, 20), 'the radius opens out as it climbs', F_LABEL, INK, 'mm')
+    cone = [{'turns': 3.0, 'pitch': 0.42, 'radius': 0.32}, {'pitch': 0.42, 'radius': 1.0}]
+    at = helix(d, cone, (58, 34, 242, 168), True)
+    lo, hi = at.edge(0.0, 1), at.edge(at.total, 1)
+    dashed(d, (at.cx, lo[1] + 10), (at.cx, hi[1] - 10), HAIR, 1.0)  # the axis
+    dashed(d, (lo[0], lo[1] + 4), (lo[0], hi[1] - 4), HAIR, 1.0)    # straight up from the start
+    dashed(d, (lo[0], lo[1] + 4), (hi[0] + 6, hi[1] - 4), ORANGE, 1.3)
+    text(d, ((lo[0] + hi[0]) / 2 + 12, (lo[1] + hi[1]) / 2), 'taper', F_SMALL, ORANGE, 'lm')
+    caption(d, 'give it an angle, or the radius to finish on')
+    return img
+
+
+def clip_path():
+    """For the other command: a helix wound around a curve instead of an axis."""
+    img, d = canvas()
+    text(d, (W / 2, 20), 'wound around a curve instead of a straight axis', F_LABEL, INK, 'mm')
+    # The path runs up the picture, not across it. Across, the coil is seen
+    # straight down its own axis and collapses into a zigzag. A steady arc
+    # reads as a curve far better than a tight bulge does.
+    CX, CY, CR = 208.0, 104.0, 76.0
+    A0, A1 = math.radians(125), math.radians(235)
+
+    def bez(t):
+        a = A0 + (A1 - A0) * t
+        return (CX + CR * math.cos(a), CY + CR * math.sin(a))
+
+    def tangent(t):
+        a = A0 + (A1 - A0) * t
+        return (-math.sin(a), math.cos(a))
+
+    polyline(d, [bez(i / 120.0) for i in range(121)], HAIR, 1.4)
+
+    turns_n, rad, squash, steps = 6.0, 21.0, 0.42, 620
+    near, far, seg, was = [], [], [], None
+    for i in range(steps + 1):
+        t = i / steps
+        a = 2 * math.pi * turns_n * t
+        p, (tx, ty) = bez(t), tangent(t)
+        n = math.hypot(tx, ty) or 1.0
+        nx, ny = -ty / n, tx / n
+        q = (p[0] + rad * math.cos(a) * nx,
+             p[1] + rad * math.cos(a) * ny - squash * rad * math.sin(a))
+        this = math.sin(a) > 0
+        if was is None:
+            was = this
+        if this != was and len(seg) > 1:
+            (far if was else near).append(seg + [q])
+            seg, was = [seg[-1], q], this
+        else:
+            seg.append(q)
+    if len(seg) > 1:
+        (far if was else near).append(seg)
+    for run_pts in far:
+        polyline(d, run_pts, BLUE_FAR, 1.7)
+    for run_pts in near:
+        polyline(d, run_pts, BLUE, 1.7)
+    caption(d, 'the pitch is measured along the curve, so it stays even')
+    return img
+
+
+CLIPS = (('taper.png', clip_taper), ('path.png', clip_path),
+         ('pitch-rise.png', clip_pitch), ('turns.png', clip_turns),
          ('pitch.png', clip_pitch_cell), ('blend.png', clip_blend),
          ('ends.png', clip_ends), ('radius.png', clip_radius),
          ('stations.png', clip_stations))

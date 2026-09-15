@@ -651,12 +651,86 @@ def _add_inputs(inputs, spec=None, context='create', sketch=None):
     rh = spec.get('hand', 'right') == 'right'
     hd.listItems.add('Right hand', rh)
     hd.listItems.add('Left hand', not rh)
-    fl = inputs.addBoolValueInput('flip', 'Flip direction', True, '', bool(spec.get('flip')))
-    fl.tooltip = ('Run the helix the other way: down the axis instead of up, or from the far '
-                  'end of the path back. The winding stays right or left handed either way.')
+    inputs.addBoolValueInput('flip', 'Flip direction', True, '', bool(spec.get('flip')))
 
     _add_placement(inputs, spec, sketch)
+    _add_const_tooltips(inputs)
     _apply_mode_visibility(inputs)
+
+
+def _add_const_tooltips(inputs):
+    """Hover text for the constant pitch dialog. Set here rather than where the
+    inputs are built, so all the wording sits in one place and the pickers and
+    the placement triad, which are shared with the other command, get wording
+    that suits this one."""
+    _tip(inputs, 'mode', 'Which two numbers you want to give it',
+         'Every mode builds the same kind of curve. What changes is which two values you '
+         'type and which one Fusion works out for you.<br><br>It greys out when you edit a '
+         'finished feature, because Fusion fixes which parameters a feature owns at the '
+         'moment it is created.')
+    _tip(inputs, 'path', 'The curve the helix winds around',
+         'Pick a sketch curve or the edge of a body and the helix wraps round it instead of '
+         'round a straight axis. Pitch is measured along the curve, so the coils stay evenly '
+         'spaced round a bend.<br><br>One curve at a time. A path made of several joined '
+         'segments will not work yet.', 'path.png')
+    _tip(inputs, 'start', 'A point for the helix to begin at',
+         'It sets the radius, the angle it starts at and how far along the axis it begins, '
+         'so those boxes disappear while it is set.')
+    _tip(inputs, 'radius', 'How far the curve sits from the axis',
+         'On a tapered helix this is the radius at the start. The far end comes from the '
+         'taper angle, or from the end radius.')
+    _tip(inputs, 'endRadius', 'The radius at the far end',
+         'Use this when you know the size you want to finish on and would rather not work '
+         'the angle out. On a flat spiral it is the outside radius.', 'taper.png')
+    _tip(inputs, 'pitch', 'How far the helix climbs in one turn',
+         'It holds the same value the whole way along. Wound on a path it is measured along '
+         'the path, so the coils stay evenly spaced round a bend.<br><br>For a pitch that '
+         'changes as it goes, use the Variable Pitch Helix command instead.')
+    _tip(inputs, 'height', 'How far the helix climbs in total',
+         'Measured along the axis, from where the curve starts to where it finishes.')
+    _tip(inputs, 'turns', 'How many times it goes round',
+         'It does not have to be a whole number. Two and a half finishes on the opposite '
+         'side from where it started.')
+    _tip(inputs, 'taperBy', 'Whether you give the taper an angle or a finish radius',
+         'Both reach the same shape. Pick whichever number you already have.<br><br>It greys '
+         'out when you edit a finished feature, because it decides which parameter the '
+         'feature owns.', 'taper.png')
+    _tip(inputs, 'taper', 'How much the radius opens out as it climbs',
+         'Zero keeps the helix straight up. A positive angle opens it out as it rises and a '
+         'negative one closes it in, like a conical spring.', 'taper.png')
+    _tip(inputs, 'flip', 'Run the helix the other way',
+         'Down the axis instead of up, or from the far end of the path back towards the '
+         'start. It stays right or left handed either way, so on a path helix with no taper '
+         'there is nothing to see. Put a taper on it and the wide end swaps ends.')
+    _add_shared_tooltips(inputs)
+
+
+def _add_shared_tooltips(inputs):
+    """The pickers and the placement triad, which both dialogs build the same
+    way and which mean the same thing in each."""
+    _tip(inputs, 'plane', 'The flat plane the helix is built on',
+         'The axis points straight out of this plane. Leave it empty and Fusion uses the XY '
+         'plane, or the plane the centre point sits on if you pick one.')
+    _tip(inputs, 'center', 'A point for the axis to pass through',
+         'Use it to put the helix somewhere other than the origin. Leave it empty and the '
+         'axis sits on the origin of the plane.')
+    _tip(inputs, 'placement_grp', 'Position and direction when no points are picked',
+         'Drag the straight arrows to slide the helix along an axis and the arcs to spin it. '
+         'It only shows when a centre point and a start point have not already pinned it.')
+    _tip(inputs, 'axis', 'Which way the helix axis points',
+         'The coils lie in the plane you choose here, and the helix winds along the axis at '
+         'right angles to it.')
+    _tip(inputs, 'startAngle', 'Where around the circle the helix begins',
+         'Zero starts it on the X axis of the plane. It hides when you pick a start point, '
+         'because the point decides the angle instead.')
+    _tip(inputs, 'hand', 'Which way the helix winds as it climbs',
+         'Right hand is the usual one, the same as an ordinary screw thread. Left hand winds '
+         'the other way.')
+    _tip(inputs, 'asFeature', 'Close this sketch and wrap the helix as a feature',
+         'Leave it off and the curve goes into the sketch you are editing. Turn it on and '
+         'Fusion closes the sketch and makes the helix a feature in the timeline, which puts '
+         'its values in the Parameters dialog where other parameters can drive them.')
+    _tip(inputs, 'placement', 'Drag to move and turn the helix')
 
 
 def _seed(spec, key, default):
@@ -986,18 +1060,12 @@ def _add_var_inputs(inputs, spec=None, context='create', sketch=None):
     fl = wc.addBoolValueInput('flip', 'Flip direction', True, '', bool(spec.get('flip')))
     fl.tooltip = 'Run the helix down the axis instead of up'
     fl.tooltipDescription = (
-        'Everything else stays as it is. Station 1 is still the start, the order of the '
-        'table does not change, and a right hand helix stays right hand. It simply builds '
-        'downwards from where it starts.')
+        'Everything else stays put. Station 1 is still the start and a right hand helix is '
+        'still right hand. It builds downwards from where it starts.')
 
     if context == 'create' and _in_sketch():
-        af = inputs.addBoolValueInput('asFeature', 'Finish sketch and create parametric feature',
-                                      True, '', False)
-        af.tooltip = 'Close this sketch and wrap the helix as a feature'
-        af.tooltipDescription = (
-            'Off, the curve goes into the sketch you are editing. On, the sketch is closed '
-            'and the helix becomes a feature in the timeline, which puts its values in the '
-            'Parameters dialog where you can drive them from other parameters.')
+        inputs.addBoolValueInput('asFeature', 'Finish sketch and create parametric feature',
+                                 True, '', False)
 
     _add_var_tooltips(inputs)
     _apply_var_visibility(inputs)
@@ -1008,30 +1076,17 @@ def _add_var_tooltips(inputs):
     """Hover text for everything in the variable pitch dialog. The pickers and
     the placement triad are shared with the other command, so their wording is
     set here rather than where they are built."""
-    _tip(inputs, 'plane', 'The flat plane the helix is built on',
-         'The axis of the helix points straight out of this plane. Leave it empty and '
-         'Fusion uses the XY plane, or the plane of the centre point if you pick one.')
-    _tip(inputs, 'center', 'A point for the axis to pass through',
-         'Optional. Use it to put the helix somewhere other than the origin.')
     _tip(inputs, 'start', 'A point for the helix to begin at',
-         'Optional. It sets the angle the helix starts at and the height it starts from. '
-         'The radius still comes from the table, because a single point cannot set a '
-         'different radius at every station.')
-    _tip(inputs, 'placement_grp', 'Position and direction when no points are picked',
-         'Drag the arrows to move the helix and the arcs to turn it.')
-    _tip(inputs, 'axis', 'Which way the helix axis points',
-         'The coils lie in the plane you choose here and the helix winds along the axis '
-         'at right angles to it.')
-    _tip(inputs, 'placement', 'Drag to move and turn the helix',
-         'The straight arrows slide it along an axis and the arcs spin it. It only shows '
-         'when the helix is not already pinned by a centre point and a start point.')
+         'It sets the angle the helix starts at and the height it starts from. The radius '
+         'still comes from the table, because one point cannot set a different radius at '
+         'every station.')
+    _add_shared_tooltips(inputs)
     _tip(inputs, 'table', 'One row for each station, in order along the helix',
          'Row 1 is where the helix starts, which is why its turns cell reads start rather '
          'than a number.', 'pitch.png')
     _tip(inputs, 'readout', 'The height and the total turns, worked out from the table',
-         'Height is the area under the pitch, not the pitch multiplied by the turns. Where '
-         'the pitch is changing, a run rises by the average of the two pitches, not by '
-         'either one of them.', 'pitch-rise.png')
+         'Height is the area under the pitch curve. Multiplying the pitch by the turns only '
+         'gives the right answer where the pitch holds steady.', 'pitch-rise.png')
     for side, label, into in (('start', 'Start', 'into'), ('end', 'End', 'out of')):
         _tip(inputs, side + 'Type', 'How the %s of the helix is finished' % label.lower(),
              'Natural begins right at the station, with nothing added.<br><br>Flat adds a '
@@ -1047,12 +1102,6 @@ def _add_var_tooltips(inputs):
         _tip(inputs, side + 'Blend', 'How many turns it takes to ease %s the station' % into,
              'Spread over more turns it changes more gently. Too short and the coil has to '
              'bend sharply to catch up.', 'ends.png')
-    _tip(inputs, 'startAngle', 'Where around the circle the helix begins',
-         'Zero starts it on the X axis of the plane. It is hidden when you pick a start '
-         'point, because the point decides the angle instead.')
-    _tip(inputs, 'hand', 'Which way the helix winds as it climbs',
-         'Right hand is the usual one, the same as an ordinary screw thread. Left hand '
-         'winds the other way.')
     _tip(inputs, 'winding_grp', 'Which way the helix turns and where it starts',
          'None of this changes the pitch or the height, only the direction it winds and '
          'the point on the circle it begins from.')
@@ -1071,16 +1120,16 @@ def _add_station_row(table, k, turns, pitch, radius, lu):
     else:
         cell = tc.addValueInput('turns%d' % (k - 1), 'Turns', '', turns)
         cell.tooltip = 'Turns from station %d to station %d' % (k - 1, k)
-        cell.tooltipDescription = ('How far round the helix goes between those two '
-                                   'stations. The pitch and radius blend across it.')
+        cell.tooltipDescription = ('The helix goes this far round between those two '
+                                   'stations, blending the pitch and the radius across it.')
         cell.toolClipFilename = _clip('turns.png')
     table.addCommandInput(cell, k, 1)
     p = tc.addValueInput('pitch%d' % k, 'Pitch', lu, pitch)
     p.tooltip = 'How far the helix climbs in one turn, at station %d' % k
     p.tooltipDescription = (
-        'This is a rate, measured at this one point, not a distance the helix travels. '
-        'Where the pitch is changing between two stations, the run rises by the average '
-        'of the two, so it usually rises less than the larger pitch.')
+        'Pitch is a rate, measured at this one point. Between two stations it blends to the '
+        'next value, so the run rises by the average of the two and climbs less than the '
+        'larger pitch would suggest on its own.')
     p.toolClipFilename = _clip('pitch-rise.png')
     table.addCommandInput(p, k, 2)
     r = tc.addValueInput('radius%d' % k, 'Radius', lu, radius)
