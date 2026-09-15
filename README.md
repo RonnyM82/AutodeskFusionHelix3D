@@ -2,7 +2,7 @@
 
 An Autodesk Fusion add-in that creates parametric 3D helix, spiral and along-a-path sketch curves.
 
-![Every mode the add-in builds](docs/images/all-modes.png)
+![Every helix mode the add-in provides](docs/images/all-modes.png)
 
 Fusion's own Coil command makes a solid. This one only ever makes a sketch curve, so you can sweep it, pattern it, use it as a path, or hand it to CAM, without a body you have to delete afterwards. The curve is a degree-3 non-rational B-spline through sampled helix points with exact end tangents, 24 samples per turn. Radial error measures well under a micron.
 
