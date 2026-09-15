@@ -43,9 +43,51 @@ MODE_RP, MODE_RH, MODE_HP, MODE_SPIRAL = MODES
 _handlers = []
 _def = None
 _editing = None         # CustomFeature in the feature edit dialog
+_editing_xf = None      # its sketch's transform (sketch -> model), read before rolling back
+_editing_restore = None # TimelineObject the marker sat after when the edit dialog opened
+_editing_rolled = False
+_editing_activated = False  # activate re-fires after every pan/orbit; only the first one sets up
+_editing_deps = {}      # {'center': entity, 'start': entity} as stored when the dialog opened
+_touched = set()        # point inputs the user changed (or cleared) in the edit dialog
+_touch_armed = False    # ignore inputChanged until the dialog has finished setting itself up
+TOUCH_EVT = 'scottHelix3DDeferredTouch'
+_touch_pending = set()  # entity tokens of features rebuilt by compute since the last touch
+_touching = False
 _editing_curve = None   # SketchFixedSpline in the sketch edit dialog
 _origin_restore = None  # (component, previous lightbulb state)
 _pending_triad = None   # Matrix3D to push onto the triad when the dialog activates
+_pending_selections = []  # [(input id, entity)] to select once the dialog activates
+LOG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'Helix3D.log')
+SETTINGS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'Helix3D.settings.json')
+_triad_last = None      # last meaningful triad transform (world); restored when the triad is re-shown
+
+
+def _load_settings():
+    try:
+        with open(SETTINGS_FILE, encoding='utf-8') as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def _save_settings():
+    try:
+        with open(SETTINGS_FILE, 'w', encoding='utf-8') as f:
+            json.dump(_settings, f)
+    except OSError:
+        pass
+
+
+_settings = _load_settings()
+
+
+def _log(msg):
+    app.log(msg)
+    try:
+        with open(LOG_FILE, 'a', encoding='utf-8') as f:
+            f.write(msg + '\n')
+    except OSError:
+        pass
 
 
 # --------------------------------------------------------------------------
@@ -204,6 +246,8 @@ def _triad_to_sketch(sketch, W):
 def _add_inputs(inputs, spec=None, context='create', sketch=None):
     """context: 'create' | 'edit_feature' | 'edit_sketch'; sketch: the sketch an
     in-sketch helix lives in (enables the placement triad)."""
+    global _pending_selections
+    _pending_selections = []
     lu = app.activeProduct.unitsManager.defaultLengthUnits
     spec = spec or {}
     v = lambda k, d: adsk.core.ValueInput.createByReal(spec.get(k, d))
@@ -214,22 +258,21 @@ def _add_inputs(inputs, spec=None, context='create', sketch=None):
         dd.listItems.add(mname, mname == cur)
     dd.isEnabled = context != 'edit_feature'  # can't add/remove params on an existing feature
 
-    feature_ctx = (context == 'create' and not _in_sketch()) or context == 'edit_feature'
     if context == 'create' and not _in_sketch():
         sel = inputs.addSelectionInput('plane', 'Plane', 'Sketch plane. Helix axis is the plane normal. Empty = XY, or the centre point\'s sketch plane.')
         sel.addSelectionFilter('ConstructionPlanes')
         sel.addSelectionFilter('PlanarFaces')
         sel.setSelectionLimits(0, 1)
-    if feature_ctx:
-        for sid, label, tip in (('center', 'Center Point', 'Optional. The helix axis passes through this point.'),
-                                ('start', 'Start Point', 'Optional. Where the helix starts: sets radius, start angle and axial offset.')):
-            sel = inputs.addSelectionInput(sid, label, tip)
-            for flt in ('SketchPoints', 'ConstructionPoints', 'Vertices'):
-                sel.addSelectionFilter(flt)
-            sel.setSelectionLimits(0, 1)
-            ent = spec.get('_deps', {}).get(sid)
-            if ent:
-                sel.addSelection(ent)
+    for sid, label, tip in (('center', 'Center Point', 'Optional. The helix axis passes through this point.'),
+                            ('start', 'Start Point', 'Optional. Where the helix starts: sets radius, start angle and axial offset.')):
+        sel = inputs.addSelectionInput(sid, label, tip)
+        for flt in ('SketchPoints', 'ConstructionPoints', 'Vertices'):
+            sel.addSelectionFilter(flt)
+        sel.setSelectionLimits(0, 1)
+        ent = spec.get('_deps', {}).get(sid)
+        if ent:
+            # Selections can't be set during commandCreated; do it in activate.
+            _pending_selections.append((sid, ent))
     if context == 'create' and _in_sketch():
         inputs.addBoolValueInput('asFeature', 'Finish sketch and create parametric feature', True, '', False)
 
@@ -246,19 +289,23 @@ def _add_inputs(inputs, spec=None, context='create', sketch=None):
     hd.listItems.add('Left hand', not rh)
 
     if sketch is not None:  # in-sketch create or edit: placement triad
-        ax = inputs.addDropDownCommandInput('axis', 'Base plane', adsk.core.DropDownStyles.TextListDropDownStyle)
+        grp = inputs.addGroupCommandInput('placement_grp', 'Placement')
+        grp.isExpanded = _settings.get('placementExpanded', True)
+        grp.tooltip = 'Position and axis of the helix when it is not pinned by a centre and start point.'
+        ax = grp.children.addDropDownCommandInput('axis', 'Base plane', adsk.core.DropDownStyles.TextListDropDownStyle)
         cur_axis = spec.get('axis', 'Z')
         for label, key in AXIS_CHOICES:
             ax.listItems.add(label, key == cur_axis)
         M = sketch.transform.copy()      # default: sketch origin, axis = sketch normal
         if spec.get('triad'):
             M.setWithArray(spec['triad'])  # raw triad transform, world space
-        triad = inputs.addTriadCommandInput('placement', M)
+        triad = grp.children.addTriadCommandInput('placement', M)
         triad.hideAllScaling()
         triad.setFlipVisibility(False)
         triad.transform = M          # the constructor argument is not reliably honoured
-        global _pending_triad
+        global _pending_triad, _triad_last
         _pending_triad = M           # re-applied once the dialog is showing (activate)
+        _triad_last = M
     _apply_mode_visibility(inputs)
 
 
@@ -272,11 +319,19 @@ def _apply_mode_visibility(inputs):
     }[mode]
     for k in ('endRadius', 'pitch', 'height', 'turns', 'taper'):
         inputs.itemById(k).isVisible = k in show
-    start = inputs.itemById('start')
-    if start:
-        driven = adsk.core.SelectionCommandInput.cast(start).selectionCount > 0
-        inputs.itemById('radius').isVisible = not driven
-        inputs.itemById('startAngle').isVisible = not driven
+    if inputs.itemById('start'):
+        has_start = _effective_point(inputs, 'start') is not None
+        has_center = _effective_point(inputs, 'center') is not None
+        inputs.itemById('radius').isVisible = not has_start
+        inputs.itemById('startAngle').isVisible = not has_start
+        grp = inputs.itemById('placement_grp')
+        if grp:
+            pinned = has_center and has_start   # both points: axis = sketch normal, triad has no say
+            if grp.isVisible == pinned:
+                grp.isVisible = not pinned
+                tri = adsk.core.TriadCommandInput.cast(inputs.itemById('placement'))
+                if not pinned and tri and _triad_last:
+                    tri.transform = _triad_last   # showing the triad again resets it
 
 
 def _read_spec(inputs, sketch=None):
@@ -294,21 +349,41 @@ def _read_spec(inputs, sketch=None):
         spec['expr'][k] = val(k).expression
     tri = inputs.itemById('placement')
     if tri and sketch is not None:
+        global _triad_last
         tri = adsk.core.TriadCommandInput.cast(tri)
         axis = None
         for label, key in AXIS_CHOICES:
             if adsk.core.DropDownCommandInput.cast(inputs.itemById('axis')).selectedItem.name == label:
                 axis = key
         # positionTransform reports identity on current builds; transform is fine as scaling is hidden.
-        T = tri.transform.copy()
-        W = _axis_rotation(axis)   # local Z -> chosen triad axis
-        W.transformBy(T)           # then the triad's own placement: W = T * R
-        M = _triad_to_sketch(sketch, W)
+        # A hidden triad has been reset, so keep using the last one we saw.
+        if inputs.itemById('placement_grp').isVisible:
+            T = tri.transform.copy()
+            _triad_last = T
+        else:
+            T = _triad_last.copy()
         spec['axis'] = axis
         spec['triad'] = list(T.asArray())
-        if not M.isEqualTo(adsk.core.Matrix3D.create()):
-            spec['xform'] = list(M.asArray())
+        center, start = _effective_point(inputs, 'center'), _effective_point(inputs, 'start')
+        spec['centerToken'] = center.entityToken if center else None
+        spec['startToken'] = start.entityToken if start else None
+        _place_in_sketch(spec, sketch, center, start)
     return spec
+
+
+def _place_in_sketch(spec, sketch, center_ent, start_ent):
+    """In-sketch placement: the triad (spec['triad'], spec['axis']) unless both
+    points are set, in which case the axis is the sketch normal through the
+    centre, exactly as for a feature."""
+    if center_ent and start_ent:
+        M = adsk.core.Matrix3D.create()
+    else:
+        T = adsk.core.Matrix3D.create()
+        T.setWithArray(spec['triad'])
+        W = _axis_rotation(spec.get('axis', 'Z'))   # local Z -> chosen triad axis
+        W.transformBy(T)                            # then the triad's own placement: W = T * R
+        M = _triad_to_sketch(sketch, W)
+    _place(spec, M, _model_to_sketch(sketch.transform), center_ent, start_ent)
 
 
 def _param_ids(mode):
@@ -378,25 +453,55 @@ def _point_world(entity):
     return None
 
 
-def _apply_points(sketch, spec, center_ent, start_ent):
-    """Derive placement (and radius / start angle) in sketch space from the
-    optional centre and start points. Mutates spec."""
-    c = sketch.modelToSketchSpace(_point_world(center_ent)) if center_ent else adsk.core.Point3D.create(0, 0, 0)
-    z0 = c.z
+def _model_to_sketch(sketch_xf):
+    Si = sketch_xf.copy()
+    Si.invert()
+    return Si
+
+
+def _place(spec, M, Si, center_ent, start_ent):
+    """Finish the placement. M maps helix-local space (axis = local Z) to
+    sketch space; Si maps model space to sketch space. A centre point moves
+    the local origin onto it; a start point sets radius, start angle and the
+    axial offset. Writes spec['xform']; mutates M."""
+    def to_sketch(ent):
+        p = _point_world(ent)
+        p.transformBy(Si)
+        return p
+    if center_ent:
+        c = to_sketch(center_ent)
+        M.translation = adsk.core.Vector3D.create(c.x, c.y, c.z)
     if start_ent:
-        st = sketch.modelToSketchSpace(_point_world(start_ent))
-        dx, dy = st.x - c.x, st.y - c.y
-        r = math.hypot(dx, dy)
+        Mi = M.copy()
+        Mi.invert()
+        s = to_sketch(start_ent)
+        s.transformBy(Mi)            # start point in helix-local space
+        r = math.hypot(s.x, s.y)
         if r > 1e-9:
             spec['radius'] = r
-            spec['startAngle'] = math.atan2(dy, dx)
-        z0 = st.z
-    M = adsk.core.Matrix3D.create()
-    M.translation = adsk.core.Vector3D.create(c.x, c.y, z0)
-    if not M.isEqualTo(adsk.core.Matrix3D.create()):
-        spec['xform'] = list(M.asArray())
-    else:
+            spec['startAngle'] = math.atan2(s.y, s.x)
+        o = adsk.core.Point3D.create(0, 0, s.z)
+        o.transformBy(M)             # slide the origin along the axis to the start height
+        M.translation = adsk.core.Vector3D.create(o.x, o.y, o.z)
+    if M.isEqualTo(adsk.core.Matrix3D.create()):
         spec.pop('xform', None)
+    else:
+        spec['xform'] = list(M.asArray())
+
+
+def _apply_points(Si, spec, center_ent, start_ent):
+    """Feature placement: axis = sketch normal through the centre point."""
+    _place(spec, adsk.core.Matrix3D.create(), Si, center_ent, start_ent)
+
+
+def _entity_by_token(token):
+    if not token:
+        return None
+    des = adsk.fusion.Design.cast(app.activeProduct)
+    for e in des.findEntityByToken(token):
+        if e.isValid:
+            return e
+    return None
 
 
 def _dep_entity(cf, dep_id):
@@ -424,14 +529,59 @@ def _sketch_of(cf):
 def _rebuild_feature(cf):
     sk = _sketch_of(cf)
     spec = _spec_of_feature(cf)
-    _apply_points(sk, spec, spec['_deps']['center'], spec['_deps']['start'])
+    _apply_points(_model_to_sketch(sk.transform), spec, spec['_deps']['center'], spec['_deps']['start'])
     fs = sk.sketchCurves.sketchFixedSplines.item(0)
     return fs.replaceGeometry(build_curve(spec))
 
 
+def _touch_sketch(sk):
+    """replaceGeometry is not seen as a sketch change by features built on the
+    curve (a sweep stays stale until Compute All). Adding and deleting a point
+    is, but only as a fresh edit, not from inside the feature's own compute."""
+    sk.sketchPoints.add(adsk.core.Point3D.create(0, 0, 0)).deleteMe()
+
+
+def _draw_preview(comp, curve):
+    """Transient custom graphics for a curve in component space. Fusion drops
+    them when the preview is aborted or the command ends."""
+    g = comp.customGraphicsGroups.add()
+    c = g.addCurve(curve)
+    c.weight = 2
+    c.color = adsk.fusion.CustomGraphicsSolidColorEffect.create(adsk.core.Color.create(0, 140, 255, 255))
+
+
+def _timeline():
+    return adsk.fusion.Design.cast(app.activeProduct).timeline
+
+
+def _roll_back_for_edit(cf):
+    """Put the marker just before cf. Returns True if it is there afterwards."""
+    global _editing_rolled
+    tl, tlo = _timeline(), cf.timelineObject
+    if tl.markerPosition != tlo.index:
+        _editing_rolled = True
+        tlo.rollTo(True)
+    return tl.markerPosition == tlo.index
+
+
+def _restore_timeline():
+    global _editing_rolled
+    if not _editing_rolled:
+        return
+    _editing_rolled = False
+    if _editing_restore and _editing_restore.isValid:
+        _editing_restore.rollTo(False)
+    else:
+        _timeline().moveToEnd()
+
+
 def _spec_of_curve(curve):
     a = curve.attributes.itemByName(ATTR_GROUP, 'spec')
-    return json.loads(a.value) if a else None
+    if not a:
+        return None
+    spec = json.loads(a.value)
+    spec['_deps'] = {k: _entity_by_token(spec.get(k + 'Token')) for k in ('center', 'start')}
+    return spec
 
 
 def _is_helix_curve(entity):
@@ -445,9 +595,10 @@ UNIT_OF = {'radius': 'len', 'endRadius': 'len', 'pitch': 'len', 'height': 'len',
            'turns': '', 'taper': 'deg', 'startAngle': 'deg'}
 
 
-def _evaluate_spec(spec):
-    """Re-evaluate the stored expressions against the current user parameters.
-    Returns True if any value changed (spec is updated in place)."""
+def _evaluate_spec(spec, sketch):
+    """Re-evaluate the stored expressions against the current user parameters
+    and the placement against the current centre / start points. Returns True
+    if anything changed (spec is updated in place)."""
     um = app.activeProduct.unitsManager
     lu = um.defaultLengthUnits
     changed = False
@@ -460,12 +611,18 @@ def _evaluate_spec(spec):
         if abs(v - spec.get(k, v)) > 1e-9:
             spec[k] = v
             changed = True
+    if spec.get('triad'):
+        before = (spec.get('xform'), spec['radius'], spec['startAngle'])
+        _place_in_sketch(spec, sketch, _entity_by_token(spec.get('centerToken')),
+                         _entity_by_token(spec.get('startToken')))
+        if before != (spec.get('xform'), spec['radius'], spec['startAngle']):
+            changed = True
     return changed
 
 
 def _refresh_sketch_helices():
     """Called after any command finishes: update in-sketch helices whose
-    expressions now evaluate differently."""
+    expressions or driving points now give a different curve."""
     des = adsk.fusion.Design.cast(app.activeProduct)
     if not des:
         return
@@ -474,21 +631,49 @@ def _refresh_sketch_helices():
         if not curve or not curve.isValid:
             continue
         spec = json.loads(attr.value)
-        if _evaluate_spec(spec):
+        if _evaluate_spec(spec, curve.parentSketch):
             curve.replaceGeometry(build_curve(spec))
             attr.value = json.dumps(spec)
 
 
 def _store_spec_on_curve(curve, spec):
-    curve.attributes.add(ATTR_GROUP, 'spec', json.dumps(spec))
+    curve.attributes.add(ATTR_GROUP, 'spec', json.dumps({k: v for k, v in spec.items() if not k.startswith('_')}))
 
 
 class ComputeHandler(adsk.fusion.CustomFeatureEventHandler):
     def notify(self, args):
         try:
-            _rebuild_feature(adsk.fusion.CustomFeatureEventArgs.cast(args).customFeature)
+            cf = adsk.fusion.CustomFeatureEventArgs.cast(args).customFeature
+            _rebuild_feature(cf)
+            if not _touching:
+                _touch_pending.add(cf.entityToken)
+                app.fireCustomEvent(TOUCH_EVT)   # handled once Fusion is idle again
         except Exception:
-            app.log('Helix3D compute failed:\n' + traceback.format_exc())
+            _log('Helix3D compute failed:\n' + traceback.format_exc())
+
+
+class DeferredTouch(adsk.core.CustomEventHandler):
+    """Runs after the compute pass that rebuilt a helix: nudge its sketch so
+    features built on the curve recompute (see _touch_sketch)."""
+    def notify(self, args):
+        global _touching
+        try:
+            if ui.activeCommand in (CMD_ID, EDIT_ID, SKETCH_EDIT_ID):
+                return   # left pending; the next compute fires again
+            des = adsk.fusion.Design.cast(app.activeProduct)
+            tokens = set(_touch_pending)
+            _touch_pending.clear()
+            _touching = True
+            for tok in tokens:
+                for e in des.findEntityByToken(tok):
+                    cf = adsk.fusion.CustomFeature.cast(e)
+                    sk = _sketch_of(cf) if cf and cf.isValid else None
+                    if sk and sk.isValid:
+                        _touch_sketch(sk)
+        except Exception:
+            _log('Helix3D deferred touch failed:\n' + traceback.format_exc())
+        finally:
+            _touching = False
 
 
 # --------------------------------------------------------------------------
@@ -507,7 +692,7 @@ class TriadActivate(adsk.core.CommandEventHandler):
             if tri:
                 tri.transform = _pending_triad
         except Exception:
-            app.log('Helix3D triad activate failed:\n' + traceback.format_exc())
+            _log('Helix3D triad activate failed:\n' + traceback.format_exc())
         finally:
             _pending_triad = None
 
@@ -516,15 +701,65 @@ class InputChanged(adsk.core.InputChangedEventHandler):
     def notify(self, args):
         try:
             args = adsk.core.InputChangedEventArgs.cast(args)
-            if args.input.id in ('mode', 'start'):
+            if _touch_armed and args.input.id in ('center', 'start'):
+                _touched.add(args.input.id)
+            if args.input.id == 'center':
+                _triad_follow_center(args.inputs)
+            if args.input.id in ('mode', 'center', 'start'):
                 _apply_mode_visibility(args.inputs)
+            _advance_focus(args.inputs, args.input.id)
         except Exception:
-            app.log('Helix3D inputChanged failed:\n' + traceback.format_exc())
+            _log('Helix3D inputChanged failed:\n' + traceback.format_exc())
 
 
-def _wire(cmd, execute_handler, activate=None, destroy=None):
+def _picked(inputs, sid):
+    sel = adsk.core.SelectionCommandInput.cast(inputs.itemById(sid))
+    return sel.selection(0).entity if sel and sel.selectionCount else None
+
+
+NEXT_PICKER = {'plane': 'center', 'center': 'start', 'start': None}
+
+
+def _advance_focus(inputs, changed_id):
+    """Each picker takes one entity, so once it is filled hand selection focus
+    to the next picker. After the last one Fusion is left to its own devices:
+    the API can't give a value box focus, and releasing picker focus just
+    sends it to the canvas."""
+    if changed_id not in NEXT_PICKER:
+        return
+    sel = adsk.core.SelectionCommandInput.cast(inputs.itemById(changed_id))
+    if not sel or sel.selectionCount == 0:
+        return
+    nxt = inputs.itemById(NEXT_PICKER[changed_id]) if NEXT_PICKER[changed_id] else None
+    if nxt and nxt.isVisible:
+        adsk.core.SelectionCommandInput.cast(nxt).hasFocus = True
+
+
+def _triad_follow_center(inputs):
+    """Sit the triad on the centre point so its position isn't misleading."""
+    global _triad_last
+    tri = adsk.core.TriadCommandInput.cast(inputs.itemById('placement'))
+    c = _effective_point(inputs, 'center')
+    if not tri or c is None:
+        return
+    T = tri.transform.copy()
+    p = _point_world(c)
+    T.translation = adsk.core.Vector3D.create(p.x, p.y, p.z)
+    tri.transform = T
+    _triad_last = T
+
+
+def _remember_placement_group(inputs):
+    grp = inputs.itemById('placement_grp')
+    if grp and _settings.get('placementExpanded', True) != grp.isExpanded:
+        _settings['placementExpanded'] = grp.isExpanded
+        _save_settings()
+
+
+def _wire(cmd, execute_handler, activate=None, destroy=None, preview=None):
     for ev, h in ((cmd.execute, execute_handler), (cmd.inputChanged, InputChanged()),
-                  (cmd.activate, activate), (cmd.destroy, destroy)):
+                  (cmd.activate, activate), (cmd.destroy, destroy),
+                  (cmd.executePreview, preview)):
         if h:
             ev.add(h)
             _handlers.append(h)
@@ -533,13 +768,18 @@ def _wire(cmd, execute_handler, activate=None, destroy=None):
 # --------------------------------------------------------------------------
 # Create command
 # --------------------------------------------------------------------------
+def _create_sketch(comp, plane, spec, center_ent=None, start_ent=None):
+    sk = comp.sketches.add(plane)
+    sk.name = 'Helix'
+    _apply_points(_model_to_sketch(sk.transform), spec, center_ent, start_ent)
+    sk.sketchCurves.sketchFixedSplines.addByNurbsCurve(build_curve(spec))
+    return sk
+
+
 def _create_feature(comp, plane, spec, center_ent=None, start_ent=None):
     lu = app.activeProduct.unitsManager.defaultLengthUnits
     units = {'len': lu, 'deg': 'deg', '': ''}
-    sk = comp.sketches.add(plane)
-    sk.name = 'Helix'
-    _apply_points(sk, spec, center_ent, start_ent)
-    sk.sketchCurves.sketchFixedSplines.addByNurbsCurve(build_curve(spec))
+    sk = _create_sketch(comp, plane, spec, center_ent, start_ent)
 
     cfi = comp.features.customFeatures.createInput(_def)
     for pid in _param_ids(spec['mode']):
@@ -558,6 +798,15 @@ def _create_feature(comp, plane, spec, center_ent=None, start_ent=None):
     return cf
 
 
+def _feature_placement(inputs, comp):
+    """(plane, centre point, start point) for a feature created outside a sketch."""
+    plane, center_ent, start_ent = _picked(inputs, 'plane'), _picked(inputs, 'center'), _picked(inputs, 'start')
+    if plane is None:
+        sp = adsk.fusion.SketchPoint.cast(center_ent) if center_ent else None
+        plane = sp.parentSketch.referencePlane if sp else comp.xYConstructionPlane
+    return plane, center_ent, start_ent
+
+
 class CreateExecute(adsk.core.CommandEventHandler):
     def notify(self, args):
         try:
@@ -571,35 +820,59 @@ class CreateExecute(adsk.core.CommandEventHandler):
                     curve = sk.sketchCurves.sketchFixedSplines.addByNurbsCurve(build_curve(spec))
                     _store_spec_on_curve(curve, spec)
                     return
-                plane = sk.referencePlane
-                comp = sk.parentComponent
-                _create_feature(comp, plane, spec)
+                # A feature can't carry the triad; it is placed by the plane and points only.
+                _create_feature(sk.parentComponent, sk.referencePlane, spec,
+                                _picked(inputs, 'center'), _picked(inputs, 'start'))
                 return
             comp = des.activeComponent
-            pick = lambda sid: (lambda s: s.selection(0).entity if s.selectionCount else None)(
-                adsk.core.SelectionCommandInput.cast(inputs.itemById(sid)))
-            plane, center_ent, start_ent = pick('plane'), pick('center'), pick('start')
-            if plane is None:
-                sp = adsk.fusion.SketchPoint.cast(center_ent) if center_ent else None
-                plane = sp.parentSketch.referencePlane if sp else comp.xYConstructionPlane
+            plane, center_ent, start_ent = _feature_placement(inputs, comp)
             _create_feature(comp, plane, spec, center_ent, start_ent)
         except Exception:
             ui.messageBox('Helix3D create failed:\n' + traceback.format_exc())
 
 
+class CreatePreview(adsk.core.CommandEventHandler):
+    """Same geometry as execute, minus the custom feature (which must be added
+    from execute). Fusion aborts it before the next preview or the execute."""
+    def notify(self, args):
+        try:
+            args = adsk.core.CommandEventArgs.cast(args)
+            inputs = args.command.commandInputs
+            sk = _in_sketch()
+            spec = _read_spec(inputs, sk)
+            if sk:
+                curve = sk.sketchCurves.sketchFixedSplines.addByNurbsCurve(build_curve(spec))
+                if not adsk.core.BoolValueCommandInput.cast(inputs.itemById('asFeature')).value:
+                    _store_spec_on_curve(curve, spec)
+                    args.isValidResult = True
+                return
+            comp = adsk.fusion.Design.cast(app.activeProduct).activeComponent
+            plane, center_ent, start_ent = _feature_placement(inputs, comp)
+            _create_sketch(comp, plane, spec, center_ent, start_ent)
+        except Exception:
+            _log('Helix3D preview failed:\n' + traceback.format_exc())
+
+
 class CreateDestroy(adsk.core.CommandEventHandler):
     def notify(self, args):
         _show_origin(False)
+        try:
+            _remember_placement_group(adsk.core.CommandEventArgs.cast(args).command.commandInputs)
+        except Exception:
+            pass
 
 
 class CreateCreated(adsk.core.CommandCreatedEventHandler):
     def notify(self, args):
+        global _editing_deps, _touched, _touch_armed
         try:
             cmd = adsk.core.CommandCreatedEventArgs.cast(args).command
+            _editing_deps, _touched, _touch_armed = {}, set(), True
             _add_inputs(cmd.commandInputs, context='create', sketch=_in_sketch())
             if not _in_sketch():
                 _show_origin(True)
-            _wire(cmd, CreateExecute(), TriadActivate() if _in_sketch() else None, CreateDestroy())
+            _wire(cmd, CreateExecute(), TriadActivate() if _in_sketch() else None, CreateDestroy(),
+                  CreatePreview())
         except Exception:
             ui.messageBox('Helix3D command failed:\n' + traceback.format_exc())
 
@@ -607,57 +880,181 @@ class CreateCreated(adsk.core.CommandCreatedEventHandler):
 # --------------------------------------------------------------------------
 # Edit feature command (Edit Feature on the timeline node)
 # --------------------------------------------------------------------------
+class HelixError(Exception):
+    """A message for the user, not a traceback."""
+
+
+def _describe(ent):
+    if ent is None:
+        return 'none'
+    p = _point_world(ent) if ent.isValid else None
+    return '%s%s' % (ent.objectType.split('::')[-1],
+                     ' at (%.3f, %.3f, %.3f)' % (p.x, p.y, p.z) if p else ' (invalid)')
+
+
 class EditExecute(adsk.core.CommandEventHandler):
     def notify(self, args):
         try:
             inputs = adsk.core.CommandEventArgs.cast(args).command.commandInputs
             spec = _read_spec(inputs)
             cf = _editing
+            # Grab the picks before the timeline moves; the inputs may not hold
+            # them once their geometry is rolled away.
+            picks = {sid: _effective_point(inputs, sid) for sid in ('center', 'start')}
+            _log('Helix3D edit: picks ' + ', '.join('%s=%s' % (k, _describe(v)) for k, v in picks.items())
+                 + '; touched=%s' % sorted(_touched))
+            # Dependencies can only change while the marker sits just before the
+            # feature; rolling back earlier (in activate) does not survive the
+            # preview aborts and pan/orbit re-activations on this build.
+            tl = _timeline()
+            if not _roll_back_for_edit(cf):
+                _log('Helix3D edit: marker %d, feature index %d after roll back'
+                        % (tl.markerPosition, cf.timelineObject.index))
+            for sid, label in (('center', 'Center Point'), ('start', 'Start Point')):
+                new_ent = picks[sid]
+                dep = cf.dependencies.itemById(sid)
+                if new_ent is None:
+                    if dep:
+                        dep.deleteMe()
+                    continue
+                if not new_ent.isValid:
+                    raise HelixError('%s: that geometry is created after the helix in the timeline, '
+                                     'so it cannot drive the helix. Pick something earlier.' % label)
+                if dep is None:
+                    cf.dependencies.add(sid, new_ent)
+                elif dep.entity.entityToken != new_ent.entityToken:
+                    dep.entity = new_ent
+            _log('Helix3D edit: dependencies now ' + ', '.join(
+                '%s=%s' % (cf.dependencies.item(i).id, _describe(cf.dependencies.item(i).entity))
+                for i in range(cf.dependencies.count)))
+            cf.customNamedValues.addOrSetValue('hand', spec['hand'])
             for i in range(cf.parameters.count):
                 p = cf.parameters.item(i)
                 p.expression = spec['expr'][p.id]
-            cf.customNamedValues.addOrSetValue('hand', spec['hand'])
-            for sid in ('center', 'start'):
-                sel = adsk.core.SelectionCommandInput.cast(inputs.itemById(sid))
-                new_ent = sel.selection(0).entity if sel.selectionCount else None
-                dep = cf.dependencies.itemById(sid)
-                if dep and (new_ent is None or dep.entity.entityToken != new_ent.entityToken):
-                    dep.deleteMe()
-                    dep = None
-                if new_ent is not None and dep is None:
-                    cf.dependencies.add(sid, new_ent)
+            _restore_timeline()
             # Direction and points aren't parameters, so rebuild explicitly.
             _rebuild_feature(cf)
+        except HelixError as e:
+            ui.messageBox(str(e), 'Helix3D')
         except Exception:
             ui.messageBox('Helix3D edit failed:\n' + traceback.format_exc())
 
 
-class EditActivate(adsk.core.CommandEventHandler):
+def _effective_point(inputs, sid):
+    """The picker's entity; or, if the user never touched the picker, the point
+    the feature already stores (the pickers are not reliably pre-filled)."""
+    ent = _picked(inputs, sid)
+    if ent is None and sid not in _touched:
+        ent = _editing_deps.get(sid)
+    return ent
+
+
+class EditPreview(adsk.core.CommandEventHandler):
+    """Hide the feature's own sketch and draw the would-be curve as custom
+    graphics. Both live in the preview transaction, so they are redone on
+    every change and dropped when the command ends."""
     def notify(self, args):
         try:
-            _editing.timelineObject.rollTo(True)
+            inputs = adsk.core.CommandEventArgs.cast(args).command.commandInputs
+            spec = _read_spec(inputs)
+            center, start = _effective_point(inputs, 'center'), _effective_point(inputs, 'start')
+            _apply_points(_model_to_sketch(_editing_xf), spec, center, start)
+            _log('Helix3D edit preview: picker center=%s start=%s; using center=%s start=%s radius=%.4f'
+                 % (_describe(_picked(inputs, 'center')), _describe(_picked(inputs, 'start')),
+                    _describe(center), _describe(start), spec['radius']))
+            sk = _sketch_of(_editing)
+            if sk:
+                sk.isVisible = False
+            curve = build_curve(spec)
+            curve.transformBy(_editing_xf)
+            _draw_preview(_editing.parentComponent, curve)
         except Exception:
-            app.log('Helix3D edit activate failed:\n' + traceback.format_exc())
+            _log('Helix3D edit preview failed:\n' + traceback.format_exc())
+
+
+class EditActivate(adsk.core.CommandEventHandler):
+    """First activation only: try to put the stored points into the selection
+    inputs. The timeline is left alone here; execute rolls it back just for
+    the dependency update."""
+    def notify(self, args):
+        global _pending_selections, _editing_activated, _touch_armed
+        try:
+            if _editing_activated:
+                return
+            _editing_activated = True
+            args = adsk.core.CommandEventArgs.cast(args)
+            # No command.beginStep() here: on this build it fires the execute
+            # handler immediately (with the pickers still empty), which is what
+            # used to wipe the stored points.
+            _reselect_pending(args.command.commandInputs)
+        except Exception:
+            _log('Helix3D edit activate failed:\n' + traceback.format_exc())
+        finally:
+            _pending_selections = []
+            _touch_armed = True
+
+
+def _reselect_pending(inputs):
+    for sid, ent in _pending_selections:
+        sel = adsk.core.SelectionCommandInput.cast(inputs.itemById(sid))
+        ok = sel.addSelection(ent) if sel else None
+        _log('Helix3D activate: reselect %s (%s) -> %s, picker now holds %d'
+             % (sid, _describe(ent), ok, sel.selectionCount if sel else -1))
+    _apply_mode_visibility(inputs)   # radius/start angle hide when a start point is set
+
+
+class EditPreSelect(adsk.core.SelectionEventHandler):
+    """Only geometry that exists before the helix in the timeline can drive it."""
+    def notify(self, args):
+        try:
+            args = adsk.core.SelectionEventArgs.cast(args)
+            if args.activeInput.id not in ('center', 'start'):
+                return
+            ent = args.selection.entity
+            sp = adsk.fusion.SketchPoint.cast(ent)
+            cp = adsk.fusion.ConstructionPoint.cast(ent)
+            tlo = sp.parentSketch.timelineObject if sp else (cp.timelineObject if cp else None)
+            if tlo and tlo.index >= _editing.timelineObject.index:
+                args.isSelectable = False
+        except Exception:
+            _log('Helix3D edit preselect failed:\n' + traceback.format_exc())
 
 
 class EditDestroy(adsk.core.CommandEventHandler):
     def notify(self, args):
-        global _editing
+        global _editing, _editing_xf, _editing_restore
         try:
-            adsk.fusion.Design.cast(app.activeProduct).timeline.moveToEnd()
+            _restore_timeline()
+            sk = _sketch_of(_editing)
+            if sk:
+                sk.isVisible = True
         except Exception:
-            pass
-        _editing = None
+            _log('Helix3D edit destroy failed:\n' + traceback.format_exc())
+        _editing = _editing_xf = _editing_restore = None
 
 
 class EditCreated(adsk.core.CommandCreatedEventHandler):
     def notify(self, args):
-        global _editing
+        global _editing, _editing_xf, _editing_restore, _editing_rolled, _editing_activated
+        global _editing_deps, _touched, _touch_armed
         try:
             cmd = adsk.core.CommandCreatedEventArgs.cast(args).command
             _editing = adsk.fusion.CustomFeature.cast(ui.activeSelections.item(0).entity)
-            _add_inputs(cmd.commandInputs, _spec_of_feature(_editing), context='edit_feature')
-            _wire(cmd, EditExecute(), EditActivate(), EditDestroy())
+            _editing_xf = _sketch_of(_editing).transform
+            tl = _timeline()
+            _editing_restore = tl.item(tl.markerPosition - 1) if tl.markerPosition > 0 else None
+            _editing_rolled = False
+            _editing_activated = False
+            _touched = set()
+            _touch_armed = False
+            spec = _spec_of_feature(_editing)
+            _editing_deps = {k: v for k, v in spec['_deps'].items() if v}
+            _log('Helix3D edit open: stored ' + ', '.join('%s=%s' % (k, _describe(v)) for k, v in _editing_deps.items()))
+            _add_inputs(cmd.commandInputs, spec, context='edit_feature')
+            _wire(cmd, EditExecute(), EditActivate(), EditDestroy(), EditPreview())
+            h = EditPreSelect()
+            cmd.preSelect.add(h)
+            _handlers.append(h)
         except Exception:
             ui.messageBox('Helix3D edit command failed:\n' + traceback.format_exc())
 
@@ -676,15 +1073,48 @@ class SketchEditExecute(adsk.core.CommandEventHandler):
             ui.messageBox('Helix3D sketch edit failed:\n' + traceback.format_exc())
 
 
+class SketchEditPreview(adsk.core.CommandEventHandler):
+    def notify(self, args):
+        try:
+            args = adsk.core.CommandEventArgs.cast(args)
+            spec = _read_spec(args.command.commandInputs, _editing_curve.parentSketch)
+            _editing_curve.replaceGeometry(build_curve(spec))
+            _store_spec_on_curve(_editing_curve, spec)
+            args.isValidResult = True   # preview is the final result; execute is skipped
+        except Exception:
+            _log('Helix3D sketch edit preview failed:\n' + traceback.format_exc())
+
+
 class SketchEditDestroy(adsk.core.CommandEventHandler):
     def notify(self, args):
         global _editing_curve
+        try:
+            _remember_placement_group(adsk.core.CommandEventArgs.cast(args).command.commandInputs)
+        except Exception:
+            pass
         _editing_curve = None
+
+
+class SketchEditActivate(adsk.core.CommandEventHandler):
+    def notify(self, args):
+        global _pending_selections, _editing_activated, _touch_armed
+        try:
+            if _editing_activated:
+                return
+            _editing_activated = True
+            args = adsk.core.CommandEventArgs.cast(args)
+            TriadActivate().notify(args)
+            _reselect_pending(args.command.commandInputs)   # no beginStep(): it would execute now
+        except Exception:
+            _log('Helix3D sketch edit activate failed:\n' + traceback.format_exc())
+        finally:
+            _pending_selections = []
+            _touch_armed = True
 
 
 class SketchEditCreated(adsk.core.CommandCreatedEventHandler):
     def notify(self, args):
-        global _editing_curve
+        global _editing_curve, _editing_deps, _touched, _touch_armed, _editing_activated
         try:
             cmd = adsk.core.CommandCreatedEventArgs.cast(args).command
             curve = None
@@ -697,9 +1127,11 @@ class SketchEditCreated(adsk.core.CommandCreatedEventHandler):
                 ui.messageBox('Select a helix curve created by Helix3D first.')
                 return
             _editing_curve = curve
-            _add_inputs(cmd.commandInputs, _spec_of_curve(curve), context='edit_sketch',
-                        sketch=curve.parentSketch)
-            _wire(cmd, SketchEditExecute(), TriadActivate(), SketchEditDestroy())
+            spec = _spec_of_curve(curve)
+            _editing_deps = {k: v for k, v in spec['_deps'].items() if v}
+            _touched, _touch_armed, _editing_activated = set(), False, False
+            _add_inputs(cmd.commandInputs, spec, context='edit_sketch', sketch=curve.parentSketch)
+            _wire(cmd, SketchEditExecute(), SketchEditActivate(), SketchEditDestroy(), SketchEditPreview())
         except Exception:
             ui.messageBox('Helix3D sketch edit command failed:\n' + traceback.format_exc())
 
@@ -708,11 +1140,14 @@ class CommandTerminated(adsk.core.ApplicationCommandEventHandler):
     def notify(self, args):
         try:
             cid = adsk.core.ApplicationCommandEventArgs.cast(args).commandId
-            if cid in (CMD_ID, SKETCH_EDIT_ID, 'SelectCommand'):
+            if cid in (CMD_ID, EDIT_ID, SKETCH_EDIT_ID, 'SelectCommand'):
+                return
+            # Pan/orbit terminate too; don't touch the model under one of our dialogs.
+            if ui.activeCommand in (CMD_ID, EDIT_ID, SKETCH_EDIT_ID):
                 return
             _refresh_sketch_helices()
         except Exception:
-            app.log('Helix3D refresh failed:\n' + traceback.format_exc())
+            _log('Helix3D refresh failed:\n' + traceback.format_exc())
 
 
 class MarkingMenu(adsk.core.MarkingMenuEventHandler):
@@ -727,7 +1162,7 @@ class MarkingMenu(adsk.core.MarkingMenuEventHandler):
                 menu.addSeparator(SKETCH_EDIT_ID + '_sep')
                 menu.addCommand(ui.commandDefinitions.itemById(SKETCH_EDIT_ID))
         except Exception:
-            app.log('Helix3D marking menu failed:\n' + traceback.format_exc())
+            _log('Helix3D marking menu failed:\n' + traceback.format_exc())
 
 
 # --------------------------------------------------------------------------
@@ -761,6 +1196,11 @@ def run(context):
         ui.markingMenuDisplaying.add(h)
         _handlers.append(h)
 
+        app.unregisterCustomEvent(TOUCH_EVT)   # stale registration from a previous run
+        h = DeferredTouch()
+        app.registerCustomEvent(TOUCH_EVT).add(h)
+        _handlers.append(h)
+
         h = CommandTerminated()
         ui.commandTerminated.add(h)
         _handlers.append(h)
@@ -776,6 +1216,7 @@ def run(context):
 
 def stop(context):
     try:
+        app.unregisterCustomEvent(TOUCH_EVT)
         for pid in PANELS:
             panel = ui.allToolbarPanels.itemById(pid)
             ctrl = panel.controls.itemById(CMD_ID) if panel else None

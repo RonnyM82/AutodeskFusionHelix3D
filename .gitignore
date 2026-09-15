@@ -1,2 +1,5 @@
+.vscode/
+Helix3D.log
+Helix3D.settings.json
 __pycache__/
 *.pyc
