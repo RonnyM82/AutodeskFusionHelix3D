@@ -38,6 +38,7 @@ VAR_EDIT_ID = 'scottHelix3DVarEdit'
 OUR_COMMANDS = (CMD_ID, EDIT_ID, SKETCH_EDIT_ID, VAR_CMD_ID, VAR_EDIT_ID)
 PANELS = ('SketchCreatePanel', 'SolidCreatePanel')
 ICONS = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'resources')
+VAR_ICONS = os.path.join(ICONS, 'variable')   # same helix, uneven coils
 ATTR_GROUP = 'Helix3D'
 SAMPLES_PER_TURN = 24
 PREVIEW_SAMPLES_PER_TURN = 12   # previews only have to look right; see build_curve
@@ -1935,11 +1936,11 @@ class MarkingMenu(adsk.core.MarkingMenuEventHandler):
 # --------------------------------------------------------------------------
 # Add-in entry points
 # --------------------------------------------------------------------------
-def _button(cid, name, tip, handler):
+def _button(cid, name, tip, handler, icons=ICONS):
     old = ui.commandDefinitions.itemById(cid)
     if old:
         old.deleteMe()
-    d = ui.commandDefinitions.addButtonDefinition(cid, name, tip, ICONS)
+    d = ui.commandDefinitions.addButtonDefinition(cid, name, tip, icons)
     d.commandCreated.add(handler)
     _handlers.append(handler)
     return d
@@ -1954,9 +1955,9 @@ def run(context):
         var_def = _button(VAR_CMD_ID, 'Variable Pitch Helix',
                           'Create a helix whose pitch and radius change along its length, '
                           'for progressive springs and timing screws',
-                          CreateCreated(variable=True))
+                          CreateCreated(variable=True), VAR_ICONS)
         _button(VAR_EDIT_ID, 'Edit Variable Pitch Helix',
-                'Edit a parametric variable pitch helix', EditCreated())
+                'Edit a parametric variable pitch helix', EditCreated(), VAR_ICONS)
 
         # The edit command must exist before it is assigned to the definition.
         _def = adsk.fusion.CustomFeatureDefinition.create(CF_ID, 'Helix', ICONS)
@@ -1965,7 +1966,7 @@ def run(context):
         _def.customFeatureCompute.add(h)
         _handlers.append(h)
 
-        _def_var = adsk.fusion.CustomFeatureDefinition.create(VAR_CF_ID, 'Variable Helix', ICONS)
+        _def_var = adsk.fusion.CustomFeatureDefinition.create(VAR_CF_ID, 'Variable Helix', VAR_ICONS)
         _def_var.editCommandId = VAR_EDIT_ID
         h = ComputeHandler()
         _def_var.customFeatureCompute.add(h)
