@@ -1,6 +1,6 @@
 # Autodesk Fusion Helix 3D Sketch Feature
 
-A Fusion 360 add-in that creates a parametric 3D helix sketch curve.
+An Autodesk Fusion add-in that creates a parametric 3D helix sketch curve.
 
 ## What it does
 
