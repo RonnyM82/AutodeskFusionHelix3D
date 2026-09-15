@@ -32,6 +32,10 @@ CF_ID = 'moyseHelix3D_v2'
 CMD_ID = 'scottHelix3DCreate'
 EDIT_ID = 'scottHelix3DEdit'
 SKETCH_EDIT_ID = 'scottHelix3DSketchEdit'
+VAR_CF_ID = 'moyseHelix3DVar'
+VAR_CMD_ID = 'scottHelix3DVarCreate'
+VAR_EDIT_ID = 'scottHelix3DVarEdit'
+OUR_COMMANDS = (CMD_ID, EDIT_ID, SKETCH_EDIT_ID, VAR_CMD_ID, VAR_EDIT_ID)
 PANELS = ('SketchCreatePanel', 'SolidCreatePanel')
 ICONS = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'resources')
 ATTR_GROUP = 'Helix3D'
@@ -42,6 +46,11 @@ MODES = ['Revolutions & Pitch', 'Revolutions & Height', 'Height & Pitch', 'Spira
          'Path & Pitch', 'Path & Revolutions']
 MODE_RP, MODE_RH, MODE_HP, MODE_SPIRAL, MODE_PP, MODE_PR = MODES
 PATH_MODES = (MODE_PP, MODE_PR)
+# The variable pitch helix has its own command and its own dialog, so this is a
+# spec value rather than another item in the Mode dropdown.
+MODE_VAR = 'Variable Pitch'
+BLENDS = [('Smooth', 'smooth'), ('Linear', 'linear')]
+MAX_STATIONS = 10
 PICKERS = ('plane', 'path', 'center', 'start')   # dialog order; selection focus walks along it
 
 
@@ -50,6 +59,7 @@ class HelixError(Exception):
 
 _handlers = []
 _def = None
+_def_var = None
 _editing = None         # CustomFeature in the feature edit dialog
 _editing_xf = None      # its sketch's transform (sketch -> model), read before rolling back
 _editing_restore = None # TimelineObject the marker sat after when the edit dialog opened
@@ -307,6 +317,158 @@ def _fit_nurbs(Q, D0, Dn):
     return P, U
 
 
+def _pchip_end_slope(d0, d1, h0, h1):
+    """Slope at the first or last station: the one sided estimate, clamped so
+    the end span cannot overshoot (Fritsch-Carlson)."""
+    m = ((2.0 * h0 + h1) * d0 - h0 * d1) / (h0 + h1)
+    if m * d0 <= 0.0:
+        return 0.0
+    if d0 * d1 <= 0.0 and abs(m) > abs(3.0 * d0):
+        return 3.0 * d0
+    return m
+
+
+def _pchip_slopes(xs, ys):
+    """Monotone cubic slopes (Fritsch-Carlson). Two stations at the same value
+    give an exactly flat run between them, which is what a dwell and a stretch
+    of constant pitch both need, and no span ever overshoots its two ends."""
+    n = len(xs)
+    h = [xs[i + 1] - xs[i] for i in range(n - 1)]
+    d = [(ys[i + 1] - ys[i]) / h[i] for i in range(n - 1)]
+    if n == 2:
+        return [d[0], d[0]]
+    m = [0.0] * n
+    for i in range(1, n - 1):
+        if d[i - 1] * d[i] <= 0.0:
+            continue            # a turning point, so flat here: no overshoot
+        w1, w2 = 2.0 * h[i] + h[i - 1], h[i] + 2.0 * h[i - 1]
+        m[i] = (w1 + w2) / (w1 / d[i - 1] + w2 / d[i])
+    m[0] = _pchip_end_slope(d[0], d[1], h[0], h[1])
+    m[-1] = _pchip_end_slope(d[-1], d[-2], h[-1], h[-2])
+    return m
+
+
+class _Ramp:
+    """A quantity that varies along the helix: given at the stations, cubic in
+    between. It carries its own integral, because the height of a variable
+    pitch helix is the area under the pitch. smooth=False ramps in straight
+    lines instead, the way SolidWorks does it."""
+
+    def __init__(self, xs, ys, smooth=True):
+        self.xs, self.ys, self.smooth = xs, ys, smooth
+        self.h = [xs[i + 1] - xs[i] for i in range(len(xs) - 1)]
+        self.m = _pchip_slopes(xs, ys) if smooth else None
+        self.cum = [0.0]
+        for i in range(len(self.h)):
+            self.cum.append(self.cum[-1] + self._area(i, 1.0))
+
+    def _span(self, x):
+        i = 0
+        while i < len(self.h) - 1 and x >= self.xs[i + 1]:
+            i += 1
+        return i, min(max((x - self.xs[i]) / self.h[i], 0.0), 1.0)
+
+    def _ends(self, i):
+        y0, y1 = self.ys[i], self.ys[i + 1]
+        if self.smooth:
+            return y0, y1, self.m[i], self.m[i + 1]
+        s = (y1 - y0) / self.h[i]
+        return y0, y1, s, s
+
+    def value(self, x):
+        i, t = self._span(x)
+        y0, y1, m0, m1 = self._ends(i)
+        t2, t3 = t * t, t * t * t
+        return (y0 * (2 * t3 - 3 * t2 + 1) + y1 * (3 * t2 - 2 * t3)
+                + self.h[i] * (m0 * (t3 - 2 * t2 + t) + m1 * (t3 - t2)))
+
+    def slope(self, x):
+        i, t = self._span(x)
+        y0, y1, m0, m1 = self._ends(i)
+        t2 = t * t
+        return ((6 * t2 - 6 * t) * (y0 - y1) / self.h[i]
+                + m0 * (3 * t2 - 4 * t + 1) + m1 * (3 * t2 - 2 * t))
+
+    def _area(self, i, t):
+        """Integral over the first t of span i. Exact: the span is a cubic."""
+        y0, y1, m0, m1 = self._ends(i)
+        h = self.h[i]
+        t2, t3, t4 = t * t, t * t * t, t * t * t * t
+        return (h * (y0 * (t4 / 2 - t3 + t) + y1 * (t3 - t4 / 2))
+                + h * h * (m0 * (t4 / 4 - 2 * t3 / 3 + t2 / 2) + m1 * (t4 / 4 - t3 / 3)))
+
+    def integral(self, x):
+        i, t = self._span(x)
+        return self.cum[i] + self._area(i, t)
+
+    def total(self):
+        return self.cum[-1]
+
+
+def _station_axes(stations):
+    """(turns at each station, pitches, radii), with the values checked."""
+    if len(stations) < 2:
+        raise HelixError('A variable pitch helix needs at least two stations.')
+    xs, ps, rs = [0.0], [], []
+    for i, st in enumerate(stations):
+        p, r = st.get('pitch', 0.0), st.get('radius', 0.0)
+        if p < -1e-9:
+            raise HelixError('Station %d: pitch cannot be negative. Use Flip direction '
+                             'to run the helix the other way.' % (i + 1))
+        if r <= 1e-9:
+            raise HelixError('Station %d: radius has to be more than zero.' % (i + 1))
+        ps.append(max(p, 0.0))
+        rs.append(r)
+        if i < len(stations) - 1:
+            t = st.get('turns', 0.0)
+            if t <= 1e-9:
+                raise HelixError('Station %d: the turns to the next station have to be '
+                                 'more than zero.' % (i + 1))
+            xs.append(xs[-1] + t)
+    return xs, ps, rs
+
+
+def var_helix_height(stations, smooth=True):
+    xs, ps, _ = _station_axes(stations)
+    return _Ramp(xs, ps, smooth).total()
+
+
+def var_helix_nurbs(stations, start_ang, right_hand, smooth=True, flip=False,
+                    per_turn=SAMPLES_PER_TURN):
+    """Control points and knots for a helix around Z whose pitch and radius
+    follow the stations. Pitch is rise per turn, so the height is the area under
+    the pitch. The pitch is smooth in slope, which makes the height smooth in
+    curvature, and that is what stops a sweep creasing at a station."""
+    xs, ps, rs = _station_axes(stations)
+    pitch, radius = _Ramp(xs, ps, smooth), _Ramp(xs, rs, smooth)
+    sign = -1.0 if flip else 1.0
+    rate = 2 * math.pi * (1 if right_hand else -1) * sign
+
+    def pt(u):
+        a = start_ang + rate * u
+        r = radius.value(u)
+        return (r * math.cos(a), r * math.sin(a), sign * pitch.integral(u))
+
+    def deriv(u):
+        a = start_ang + rate * u
+        r, dr = radius.value(u), radius.slope(u)
+        return (dr * math.cos(a) - r * math.sin(a) * rate,
+                dr * math.sin(a) + r * math.cos(a) * rate,
+                sign * pitch.value(u))
+
+    # Sample each span on its own so a sample lands exactly on every station.
+    us = [0.0]
+    for i in range(len(xs) - 1):
+        k = _sample_count(xs[i + 1] - xs[i], per_turn)
+        us.extend(xs[i] + (xs[i + 1] - xs[i]) * j / k for j in range(1, k + 1))
+    # The fit runs on 0..1, so the end tangents have to be per unit of that, not
+    # per turn. Getting this wrong costs three hundred times the radial error.
+    span = us[-1] - us[0]
+    D0, Dn = deriv(us[0]), deriv(us[-1])
+    return _fit_nurbs([pt(u) for u in us],
+                      tuple(c * span for c in D0), tuple(c * span for c in Dn))
+
+
 def resolve(spec):
     """Turn a spec dict (mode + raw values, internal units) into
     (r0, dr, height, turns). Values not used by the mode are ignored."""
@@ -332,6 +494,16 @@ def resolve(spec):
     return r0, dr, height, turns
 
 
+def _curve_from(P, U, xf):
+    pts = [adsk.core.Point3D.create(*p) for p in P]
+    if xf:
+        M = adsk.core.Matrix3D.create()
+        M.setWithArray(xf)
+        for pt in pts:
+            pt.transformBy(M)
+    return adsk.core.NurbsCurve3D.createNonRational(pts, 3, U, False)
+
+
 def build_curve(spec, per_turn=SAMPLES_PER_TURN):
     """NurbsCurve3D in sketch space from a spec dict. per_turn is dropped for
     previews, where the curve only has to look right; everything that gets
@@ -349,20 +521,17 @@ def build_curve(spec, per_turn=SAMPLES_PER_TURN):
         for pt in pts:
             pt.transformBy(spec['_Si'])   # path is sampled in model space
         return adsk.core.NurbsCurve3D.createNonRational(pts, 3, U, False)
+    if spec['mode'] == MODE_VAR:
+        P, U = var_helix_nurbs(spec['stations'], spec['startAngle'], spec['hand'] == 'right',
+                               spec.get('blend', 'smooth') == 'smooth', flip, per_turn)
+        return _curve_from(P, U, spec.get('xform'))
     r0, dr, height, turns = resolve(spec)
     if flip:
         # Reverse the climb and the sweep together. Reversing only the climb
         # would turn a right hand helix into a left hand one.
         height, turns = -height, -turns
     P, U = helix_nurbs(r0, dr, height, turns, spec['startAngle'], spec['hand'] == 'right', per_turn)
-    pts = [adsk.core.Point3D.create(*p) for p in P]
-    xf = spec.get('xform')
-    if xf:
-        M = adsk.core.Matrix3D.create()
-        M.setWithArray(xf)
-        for pt in pts:
-            pt.transformBy(M)
-    return adsk.core.NurbsCurve3D.createNonRational(pts, 3, U, False)
+    return _curve_from(P, U, spec.get('xform'))
 
 
 def _path_geometry(ent):
@@ -437,7 +606,7 @@ def _add_inputs(inputs, spec=None, context='create', sketch=None):
     lu = app.activeProduct.unitsManager.defaultLengthUnits
     spec = spec or {}
     _seeded_end_radius = 'endRadius' in spec   # an existing end radius must not be overwritten
-    v = lambda k, d: adsk.core.ValueInput.createByReal(spec.get(k, d))
+    v = lambda k, d: _seed(spec, k, d)
 
     dd = inputs.addDropDownCommandInput('mode', 'Mode', adsk.core.DropDownStyles.TextListDropDownStyle)
     cur = spec.get('mode', MODE_RP)
@@ -445,24 +614,7 @@ def _add_inputs(inputs, spec=None, context='create', sketch=None):
         dd.listItems.add(mname, mname == cur)
     dd.isEnabled = context != 'edit_feature'  # can't add/remove params on an existing feature
 
-    if context == 'create' and not _in_sketch():
-        sel = inputs.addSelectionInput('plane', 'Plane', 'Sketch plane. Helix axis is the plane normal. Empty = XY, or the centre point\'s sketch plane.')
-        sel.addSelectionFilter('ConstructionPlanes')
-        sel.addSelectionFilter('PlanarFaces')
-        sel.setSelectionLimits(0, 1)
-    points = ('SketchPoints', 'ConstructionPoints', 'Vertices')
-    for sid, label, tip, filters in (
-            ('path', 'Path', 'Curve or edge the helix winds around. Pitch is measured along it.', ('SketchCurves', 'Edges')),
-            ('center', 'Center Point', 'Optional. The helix axis passes through this point.', points),
-            ('start', 'Start Point', 'Optional. Where the helix starts: sets radius, start angle and axial offset.', points)):
-        sel = inputs.addSelectionInput(sid, label, tip)
-        for flt in filters:
-            sel.addSelectionFilter(flt)
-        sel.setSelectionLimits(0, 1)
-        ent = spec.get('_deps', {}).get(sid)
-        if ent:
-            # Selections can't be set during commandCreated; do it in activate.
-            _pending_selections.append((sid, ent))
+    _add_pickers(inputs, spec, context)
     if context == 'create' and _in_sketch():
         inputs.addBoolValueInput('asFeature', 'Finish sketch and create parametric feature', True, '', False)
 
@@ -486,25 +638,73 @@ def _add_inputs(inputs, spec=None, context='create', sketch=None):
     fl.tooltip = ('Run the helix the other way: down the axis instead of up, or from the far '
                   'end of the path back. The winding stays right or left handed either way.')
 
-    if sketch is not None:  # in-sketch create or edit: placement triad
-        grp = inputs.addGroupCommandInput('placement_grp', 'Placement')
-        grp.isExpanded = _settings.get('placementExpanded', True)
-        grp.tooltip = 'Position and axis of the helix when it is not pinned by a centre and start point.'
-        ax = grp.children.addDropDownCommandInput('axis', 'Base plane', adsk.core.DropDownStyles.TextListDropDownStyle)
-        cur_axis = spec.get('axis', 'Z')
-        for label, key in AXIS_CHOICES:
-            ax.listItems.add(label, key == cur_axis)
-        M = sketch.transform.copy()      # default: sketch origin, axis = sketch normal
-        if spec.get('triad'):
-            M.setWithArray(spec['triad'])  # raw triad transform, world space
-        triad = grp.children.addTriadCommandInput('placement', M)
-        triad.hideAllScaling()
-        triad.setFlipVisibility(False)
-        triad.transform = M          # the constructor argument is not reliably honoured
-        global _pending_triad, _triad_last
-        _pending_triad = M           # re-applied once the dialog is showing (activate)
-        _triad_last = M
+    _add_placement(inputs, spec, sketch)
     _apply_mode_visibility(inputs)
+
+
+def _seed(spec, key, default):
+    """Seed a value box from the expression that was typed if there is one, so
+    reopening the dialog and pressing OK does not flatten `wire * 3` into a
+    number. Falls back to the value if the expression no longer evaluates."""
+    e = (spec.get('expr') or {}).get(key)
+    if e:
+        try:
+            app.activeProduct.unitsManager.evaluateExpression(e, _units()[_unit_of(key)])
+            return adsk.core.ValueInput.createByString(e)
+        except Exception:
+            pass
+    return adsk.core.ValueInput.createByReal(spec.get(key, default))
+
+
+def _add_pickers(inputs, spec, context, with_path=True, start_tip=None):
+    """The plane, path, centre and start selection inputs, shared by both
+    dialogs. Missing ones are simply not added; everything guards on that."""
+    if context == 'create' and not _in_sketch():
+        sel = inputs.addSelectionInput('plane', 'Plane', 'Sketch plane. Helix axis is the plane normal. Empty = XY, or the centre point\'s sketch plane.')
+        sel.addSelectionFilter('ConstructionPlanes')
+        sel.addSelectionFilter('PlanarFaces')
+        sel.setSelectionLimits(0, 1)
+    points = ('SketchPoints', 'ConstructionPoints', 'Vertices')
+    rows = [('center', 'Center Point', 'Optional. The helix axis passes through this point.', points),
+            ('start', 'Start Point',
+             start_tip or 'Optional. Where the helix starts: sets radius, start angle and axial offset.',
+             points)]
+    if with_path:
+        rows.insert(0, ('path', 'Path',
+                        'Curve or edge the helix winds around. Pitch is measured along it.',
+                        ('SketchCurves', 'Edges')))
+    for sid, label, tip, filters in rows:
+        sel = inputs.addSelectionInput(sid, label, tip)
+        for flt in filters:
+            sel.addSelectionFilter(flt)
+        sel.setSelectionLimits(0, 1)
+        ent = spec.get('_deps', {}).get(sid)
+        if ent:
+            # Selections can't be set during commandCreated; do it in activate.
+            _pending_selections.append((sid, ent))
+
+
+def _add_placement(inputs, spec, sketch):
+    """In-sketch create or edit: the placement triad and its base plane."""
+    if sketch is None:
+        return
+    grp = inputs.addGroupCommandInput('placement_grp', 'Placement')
+    grp.isExpanded = _settings.get('placementExpanded', True)
+    grp.tooltip = 'Position and axis of the helix when it is not pinned by a centre and start point.'
+    ax = grp.children.addDropDownCommandInput('axis', 'Base plane', adsk.core.DropDownStyles.TextListDropDownStyle)
+    cur_axis = spec.get('axis', 'Z')
+    for label, key in AXIS_CHOICES:
+        ax.listItems.add(label, key == cur_axis)
+    M = sketch.transform.copy()      # default: sketch origin, axis = sketch normal
+    if spec.get('triad'):
+        M.setWithArray(spec['triad'])  # raw triad transform, world space
+    triad = grp.children.addTriadCommandInput('placement', M)
+    triad.hideAllScaling()
+    triad.setFlipVisibility(False)
+    triad.transform = M          # the constructor argument is not reliably honoured
+    global _pending_triad, _triad_last
+    _pending_triad = M           # re-applied once the dialog is showing (activate)
+    _triad_last = M
 
 
 def _apply_mode_visibility(inputs):
@@ -537,15 +737,17 @@ def _apply_mode_visibility(inputs):
     has_center = not path_mode and _effective_point(inputs, 'center') is not None
     inputs.itemById('radius').isVisible = not has_start
     inputs.itemById('startAngle').isVisible = not has_start
+    # Both points pin the helix (axis = sketch normal); a path places it entirely.
+    _apply_placement_visibility(inputs, not (path_mode or (has_center and has_start)))
+
+
+def _apply_placement_visibility(inputs, want):
     grp = inputs.itemById('placement_grp')
-    if grp:
-        # Both points pin the helix (axis = sketch normal); a path places it entirely.
-        want = not (path_mode or (has_center and has_start))
-        if grp.isVisible != want:
-            grp.isVisible = want
-            tri = adsk.core.TriadCommandInput.cast(inputs.itemById('placement'))
-            if want and tri and _triad_last:
-                tri.transform = _triad_last   # showing the triad again resets it
+    if grp and grp.isVisible != want:
+        grp.isVisible = want
+        tri = adsk.core.TriadCommandInput.cast(inputs.itemById('placement'))
+        if want and tri and _triad_last:
+            tri.transform = _triad_last   # showing the triad again resets it
 
 
 def _taper_by(inputs):
@@ -568,6 +770,13 @@ def _read_spec(inputs, sketch=None):
     for k in ('radius', 'endRadius', 'pitch', 'height', 'turns', 'taper', 'startAngle'):
         spec[k] = val(k).value
         spec['expr'][k] = val(k).expression
+    _read_placement(spec, inputs, sketch)
+    return spec
+
+
+def _read_placement(spec, inputs, sketch):
+    """Triad, driving points and path, onto the spec. Shared by both dialogs;
+    sketch is None for a feature, whose placement the caller applies instead."""
     tri = inputs.itemById('placement')
     if tri and sketch is not None:
         global _triad_last
@@ -593,7 +802,165 @@ def _read_spec(inputs, sketch=None):
         path = _effective_point(inputs, 'path')
         spec['pathToken'] = path.entityToken if path else None
         _attach_path(spec, sketch.transform, path)
+
+
+# --------------------------------------------------------------------------
+# Variable pitch dialog
+# --------------------------------------------------------------------------
+def _cell(inputs, cid):
+    """A station table cell. They live on the table, not the top level."""
+    table = adsk.core.TableCommandInput.cast(inputs.itemById('table'))
+    return table.commandInputs.itemById(cid) if table else None
+
+
+def _blend_of(inputs):
+    dd = adsk.core.DropDownCommandInput.cast(inputs.itemById('blend'))
+    return dict(BLENDS)[dd.selectedItem.name]
+
+
+def _add_var_inputs(inputs, spec=None, context='create', sketch=None):
+    """The variable pitch dialog: a station count, a blend, and a table of
+    turns / pitch / radius, plus the placement the other dialog uses."""
+    global _pending_selections
+    _pending_selections = []
+    lu = app.activeProduct.unitsManager.defaultLengthUnits
+    spec = spec or {}
+    stations = spec.get('stations') or _default_stations()
+    n = max(2, min(MAX_STATIONS, len(stations)))
+
+    cnt = inputs.addIntegerSpinnerCommandInput('stations', 'Stations', 2, MAX_STATIONS, 1, n)
+    cnt.isEnabled = context != 'edit_feature'   # a feature's parameters are fixed
+    cnt.tooltip = ('How many points along the helix you set a pitch and a radius at. '
+                   'Fusion fixes which parameters a custom feature owns when it is '
+                   'created, so this is greyed out when you edit one.')
+
+    bl = inputs.addDropDownCommandInput('blend', 'Blend', adsk.core.DropDownStyles.TextListDropDownStyle)
+    cur_blend = spec.get('blend', 'smooth')
+    for label, key in BLENDS:
+        bl.listItems.add(label, key == cur_blend)
+    bl.tooltip = ('How the pitch gets from one station to the next. Smooth keeps the '
+                  'curvature continuous, so a sweep along it has no crease at a station. '
+                  'Linear ramps in a straight line, which is what SOLIDWORKS does.')
+
+    table = inputs.addTableCommandInput('table', 'Stations', 3, '1:1:1')
+    table.minimumVisibleRows = 4
+    table.maximumVisibleRows = MAX_STATIONS + 1
+    table.tablePresentationStyle = adsk.core.TablePresentationStyles.itemBorderTablePresentationStyle
+    tc = table.commandInputs
+    for hid, label in (('h_turns', 'Turns to next'), ('h_pitch', 'Pitch'), ('h_radius', 'Radius')):
+        tc.addTextBoxCommandInput(hid, '', '<b>%s</b>' % label, 1, True)
+    for i in range(MAX_STATIONS):
+        src = stations[i] if i < len(stations) else stations[-1]
+        k = i + 1
+        tc.addValueInput('turns%d' % k, 'Turns', '', _seed(spec, 'turns%d' % k, src.get('turns', 1.0)))
+        tc.addValueInput('pitch%d' % k, 'Pitch', lu, _seed(spec, 'pitch%d' % k, src.get('pitch', 1.0)))
+        tc.addValueInput('radius%d' % k, 'Radius', lu, _seed(spec, 'radius%d' % k, src.get('radius', 2.0)))
+
+    _add_pickers(inputs, spec, context, with_path=False,
+                 start_tip='Optional. Where the helix starts: sets the start angle and the '
+                           'height it starts at. The radii come from the table.')
+    if context == 'create' and _in_sketch():
+        inputs.addBoolValueInput('asFeature', 'Finish sketch and create parametric feature', True, '', False)
+
+    inputs.addValueInput('startAngle', 'Start Angle', 'deg', _seed(spec, 'startAngle', 0.0))
+    hd = inputs.addDropDownCommandInput('hand', 'Direction', adsk.core.DropDownStyles.TextListDropDownStyle)
+    rh = spec.get('hand', 'right') == 'right'
+    hd.listItems.add('Right hand', rh)
+    hd.listItems.add('Left hand', not rh)
+    fl = inputs.addBoolValueInput('flip', 'Flip direction', True, '', bool(spec.get('flip')))
+    fl.tooltip = ('Run the helix down the axis instead of up. The winding stays right or '
+                  'left handed either way, and the stations stay in the order you typed.')
+
+    _add_placement(inputs, spec, sketch)
+    tb = inputs.addTextBoxCommandInput('readout', '', '', 1, True)
+    tb.isFullWidth = True
+    _rebuild_station_table(inputs)
+    _apply_var_visibility(inputs)
+    _update_var_readout(inputs)
+
+
+def _rebuild_station_table(inputs):
+    """Show exactly as many rows as the station count asks for. The cells all
+    exist already; the table just holds the ones in use, so changing the count
+    keeps whatever was typed."""
+    table = adsk.core.TableCommandInput.cast(inputs.itemById('table'))
+    n = adsk.core.IntegerSpinnerCommandInput.cast(inputs.itemById('stations')).value
+    tc = table.commandInputs
+    table.clear()
+    for c, hid in enumerate(('h_turns', 'h_pitch', 'h_radius')):
+        table.addCommandInput(tc.itemById(hid), 0, c)
+    for i in range(n):
+        k = i + 1
+        if i < n - 1:      # the last station has nothing after it to run to
+            table.addCommandInput(tc.itemById('turns%d' % k), k, 0)
+        table.addCommandInput(tc.itemById('pitch%d' % k), k, 1)
+        table.addCommandInput(tc.itemById('radius%d' % k), k, 2)
+
+
+def _apply_var_visibility(inputs):
+    has_start = _effective_point(inputs, 'start') is not None
+    has_center = _effective_point(inputs, 'center') is not None
+    inputs.itemById('startAngle').isVisible = not has_start
+    _apply_placement_visibility(inputs, not (has_center and has_start))
+
+
+def _update_var_readout(inputs):
+    """Height and turns fall out of the table, so show them rather than asking
+    for them. It doubles as where a bad station gets reported."""
+    tb = adsk.core.TextBoxCommandInput.cast(inputs.itemById('readout'))
+    if not tb:
+        return
+    um = app.activeProduct.unitsManager
+    try:
+        spec = _read_var_spec(inputs)
+        height = var_helix_height(spec['stations'], spec['blend'] == 'smooth')
+        turns = sum(st.get('turns', 0.0) for st in spec['stations'][:-1])
+        tb.formattedText = 'Height %s over %s turns' % (
+            um.formatInternalValue(height, um.defaultLengthUnits, True),
+            um.formatInternalValue(turns, '', False))
+    except HelixError as e:
+        tb.formattedText = '<b>%s</b>' % e
+    except Exception:
+        tb.formattedText = ''
+
+
+def _read_var_spec(inputs, sketch=None):
+    """Spec dict for the variable pitch dialog, in internal units, with the
+    expressions typed into each cell."""
+    n = adsk.core.IntegerSpinnerCommandInput.cast(inputs.itemById('stations')).value
+    spec = {
+        'mode': MODE_VAR,
+        'hand': 'right' if adsk.core.DropDownCommandInput.cast(
+            inputs.itemById('hand')).selectedItem.name.startswith('Right') else 'left',
+        'flip': adsk.core.BoolValueCommandInput.cast(inputs.itemById('flip')).value,
+        'blend': _blend_of(inputs),
+        'stations': [],
+        'expr': {},
+    }
+    for i in range(n):
+        st = {}
+        for base in ('turns', 'pitch', 'radius'):
+            if base == 'turns' and i == n - 1:
+                continue
+            key = '%s%d' % (base, i + 1)
+            box = adsk.core.ValueCommandInput.cast(_cell(inputs, key))
+            st[base] = box.value
+            spec[key] = box.value
+            spec['expr'][key] = box.expression
+        spec['stations'].append(st)
+    sa = adsk.core.ValueCommandInput.cast(inputs.itemById('startAngle'))
+    spec['startAngle'] = sa.value
+    spec['expr']['startAngle'] = sa.expression
+    _read_placement(spec, inputs, sketch)
     return spec
+
+
+def _read_any_spec(inputs, sketch=None):
+    """Whichever dialog is open. The variable pitch one is the one with a
+    station count."""
+    if inputs.itemById('stations'):
+        return _read_var_spec(inputs, sketch)
+    return _read_spec(inputs, sketch)
 
 
 def _place_in_sketch(spec, sketch, center_ent, start_ent):
@@ -642,6 +1009,72 @@ def _axis_rotation(axis):
     elif axis == 'Y':
         R.setToRotation(math.radians(-90), adsk.core.Vector3D.create(1, 0, 0), o)
     return R
+
+
+def _station_ids(n):
+    """Parameter ids for n stations: the turns to the next station (all but the
+    last), the pitch and the radius at each one."""
+    ids = []
+    for i in range(n):
+        if i < n - 1:
+            ids.append('turns%d' % (i + 1))
+        ids.append('pitch%d' % (i + 1))
+        ids.append('radius%d' % (i + 1))
+    return tuple(ids)
+
+
+def _var_param_ids(n):
+    return _station_ids(n) + ('startAngle',)
+
+
+def _var_param_meta(pid):
+    """(display name, unit key) for a station parameter, as it reads in the
+    Parameters dialog."""
+    if pid in PARAM_META:
+        return PARAM_META[pid]
+    base = pid.rstrip('0123456789')
+    i = int(pid[len(base):])
+    if base == 'turns':
+        return ('Turns %d to %d' % (i, i + 1), '')
+    return ('%s %d' % (base.capitalize(), i), 'len')
+
+
+def _default_stations():
+    """A closed end, the coils, then a closed end again: the transition and
+    flat ends Inventor's Coil offers, built out of stations."""
+    return [{'turns': 1.0, 'pitch': 0.2, 'radius': 2.0},
+            {'turns': 3.0, 'pitch': 1.0, 'radius': 2.0},
+            {'turns': 1.0, 'pitch': 1.0, 'radius': 2.0},
+            {'pitch': 0.2, 'radius': 2.0}]
+
+
+def _stations_from_values(spec):
+    """Gather the flat pitch1/radius1/turns1 values on a spec back into
+    spec['stations']."""
+    n = len(spec.get('stations') or [])
+    if not n:
+        return
+    out = []
+    for i in range(n):
+        st = {}
+        for base in ('turns', 'pitch', 'radius'):
+            k = '%s%d' % (base, i + 1)
+            if k in spec:
+                st[base] = spec[k]
+            elif i < len(spec['stations']) and base in spec['stations'][i]:
+                st[base] = spec['stations'][i][base]
+        if i == n - 1:
+            st.pop('turns', None)
+        out.append(st)
+    spec['stations'] = out
+
+
+def _values_from_stations(spec):
+    """The other way round: flat ids on the spec, which is what the expression
+    dictionary and the custom feature parameters are keyed by."""
+    for i, st in enumerate(spec.get('stations') or []):
+        for base, value in st.items():
+            spec['%s%d' % (base, i + 1)] = value
 
 
 PARAM_META = {  # id: (display name, unit key)
@@ -715,7 +1148,8 @@ def _place(spec, M, Si, center_ent, start_ent):
         s.transformBy(Mi)            # start point in helix-local space
         r = math.hypot(s.x, s.y)
         if r > 1e-9:
-            spec['radius'] = r
+            if spec['mode'] != MODE_VAR:
+                spec['radius'] = r   # a variable pitch helix gets its radii from the table
             spec['startAngle'] = math.atan2(s.y, s.x)
         o = adsk.core.Point3D.create(0, 0, s.z)
         o.transformBy(M)             # slide the origin along the axis to the start height
@@ -751,10 +1185,16 @@ def _spec_of_feature(cf):
             'hand': cf.customNamedValues.value('hand') or 'right',
             'taperBy': cf.customNamedValues.value('taperBy') or 'angle',
             'flip': cf.customNamedValues.value('flip') == '1',
+            'expr': {},
             '_deps': {k: _dep_entity(cf, k) for k in ('center', 'start', 'path')}}
     for i in range(cf.parameters.count):
         p = cf.parameters.item(i)
         spec[p.id] = p.value
+        spec['expr'][p.id] = p.expression   # so reopening the dialog keeps it
+    if spec['mode'] == MODE_VAR:
+        spec['blend'] = cf.customNamedValues.value('blend') or 'smooth'
+        spec['stations'] = [{} for _ in range(int(cf.customNamedValues.value('stations') or 0))]
+        _stations_from_values(spec)
     return spec
 
 
@@ -835,18 +1275,29 @@ UNIT_OF = {'radius': 'len', 'endRadius': 'len', 'pitch': 'len', 'height': 'len',
            'turns': '', 'taper': 'deg', 'startAngle': 'deg'}
 
 
+def _units():
+    return {'len': app.activeProduct.unitsManager.defaultLengthUnits, 'deg': 'deg', '': ''}
+
+
+def _unit_of(pid):
+    """Unit key for a parameter id. Station ids carry a number on the end
+    (pitch3, turns2); everything else is looked up as it stands."""
+    return UNIT_OF[pid.rstrip('0123456789') if pid not in UNIT_OF else pid]
+
+
 def _evaluate_spec(spec, sketch):
     """Bring a stored in-sketch spec up to date: expressions against the
     current user parameters, placement against the current centre / start
     points, and the path's current shape. Mutates spec."""
     um = app.activeProduct.unitsManager
-    lu = um.defaultLengthUnits
+    units = _units()
     for k, expr in spec.get('expr', {}).items():
-        unit = {'len': lu, 'deg': 'deg', '': ''}[UNIT_OF[k]]
         try:
-            spec[k] = um.evaluateExpression(expr, unit)
+            spec[k] = um.evaluateExpression(expr, units[_unit_of(k)])
         except Exception:
             pass  # a referenced parameter went away; keep the last value
+    if spec['mode'] == MODE_VAR:
+        _stations_from_values(spec)
     if spec.get('triad'):
         _place_in_sketch(spec, sketch, _entity_by_token(spec.get('centerToken')),
                          _entity_by_token(spec.get('startToken')))
@@ -905,7 +1356,7 @@ class DeferredTouch(adsk.core.CustomEventHandler):
     def notify(self, args):
         global _touching
         try:
-            if ui.activeCommand in (CMD_ID, EDIT_ID, SKETCH_EDIT_ID):
+            if ui.activeCommand in OUR_COMMANDS:
                 return   # left pending; the next compute fires again
             des = adsk.fusion.Design.cast(app.activeProduct)
             tokens = set(_touch_pending)
@@ -948,21 +1399,32 @@ class InputChanged(adsk.core.InputChangedEventHandler):
     def notify(self, args):
         try:
             args = adsk.core.InputChangedEventArgs.cast(args)
-            if _touch_armed and args.input.id in ('center', 'start', 'path'):
-                _touched.add(args.input.id)
-            if args.input.id == 'center':
-                _triad_follow_center(args.inputs)
+            # args.inputs is whichever collection the changed input sits in, which
+            # for a table cell is the table's own. Always work from the top level.
+            inputs = adsk.core.Command.cast(args.firingEvent.sender).commandInputs
+            cid = args.input.id
+            if _touch_armed and cid in ('center', 'start', 'path'):
+                _touched.add(cid)
+            if cid == 'center':
+                _triad_follow_center(inputs)
+            if inputs.itemById('stations'):      # the variable pitch dialog
+                if cid == 'stations':
+                    _rebuild_station_table(inputs)
+                _apply_var_visibility(inputs)
+                _update_var_readout(inputs)
+                _advance_focus(inputs, cid)
+                return
             global _seeded_end_radius
-            if args.input.id == 'taperBy' and _taper_by(args.inputs) == 'radius' and not _seeded_end_radius:
+            if cid == 'taperBy' and _taper_by(inputs) == 'radius' and not _seeded_end_radius:
                 # First switch to an end radius in this dialog: start from "no taper".
                 _seeded_end_radius = True
-                er = adsk.core.ValueCommandInput.cast(args.inputs.itemById('endRadius'))
-                er.expression = adsk.core.ValueCommandInput.cast(args.inputs.itemById('radius')).expression
-            if args.input.id in ('mode', 'center', 'start', 'path', 'taperBy'):
-                _apply_mode_visibility(args.inputs)
-            if args.input.id == 'mode':
-                _focus_first_empty_picker(args.inputs)   # the pickers just changed
-            _advance_focus(args.inputs, args.input.id)
+                er = adsk.core.ValueCommandInput.cast(inputs.itemById('endRadius'))
+                er.expression = adsk.core.ValueCommandInput.cast(inputs.itemById('radius')).expression
+            if cid in ('mode', 'center', 'start', 'path', 'taperBy'):
+                _apply_mode_visibility(inputs)
+            if cid == 'mode':
+                _focus_first_empty_picker(inputs)   # the pickers just changed
+            _advance_focus(inputs, cid)
         except Exception:
             _log('Helix3D inputChanged failed:\n' + traceback.format_exc())
 
@@ -1042,7 +1504,7 @@ def _wire(cmd, execute_handler, activate=None, destroy=None, preview=None):
 def _create_sketch(comp, plane, spec, center_ent=None, start_ent=None, path_ent=None,
                    per_turn=SAMPLES_PER_TURN):
     sk = comp.sketches.add(plane)
-    sk.name = 'Helix'
+    sk.name = 'Variable Helix' if spec['mode'] == MODE_VAR else 'Helix'
     _apply_points(_model_to_sketch(sk.transform), spec, center_ent, start_ent)
     _attach_path(spec, sk.transform, path_ent)
     sk.sketchCurves.sketchFixedSplines.addByNurbsCurve(build_curve(spec, per_turn))
@@ -1050,13 +1512,14 @@ def _create_sketch(comp, plane, spec, center_ent=None, start_ent=None, path_ent=
 
 
 def _create_feature(comp, plane, spec, center_ent=None, start_ent=None, path_ent=None):
-    lu = app.activeProduct.unitsManager.defaultLengthUnits
-    units = {'len': lu, 'deg': 'deg', '': ''}
+    units = _units()
+    var = spec['mode'] == MODE_VAR
     sk = _create_sketch(comp, plane, spec, center_ent, start_ent, path_ent)
 
-    cfi = comp.features.customFeatures.createInput(_def)
-    for pid in _param_ids(spec['mode'], spec.get('taperBy', 'angle')):
-        name, ukey = PARAM_META[pid]
+    cfi = comp.features.customFeatures.createInput(_def_var if var else _def)
+    pids = _var_param_ids(len(spec['stations'])) if var else _param_ids(spec['mode'], spec.get('taperBy', 'angle'))
+    for pid in pids:
+        name, ukey = _var_param_meta(pid) if var else PARAM_META[pid]
         cfi.addCustomParameter(pid, name, adsk.core.ValueInput.createByString(spec['expr'][pid]),
                                units[ukey], True)
     cfi.addDependency('plane', plane)
@@ -1070,8 +1533,12 @@ def _create_feature(comp, plane, spec, center_ent=None, start_ent=None, path_ent
     cf = comp.features.customFeatures.add(cfi)
     cf.customNamedValues.addOrSetValue('mode', spec['mode'])
     cf.customNamedValues.addOrSetValue('hand', spec['hand'])
-    cf.customNamedValues.addOrSetValue('taperBy', spec.get('taperBy', 'angle'))
     cf.customNamedValues.addOrSetValue('flip', '1' if spec.get('flip') else '0')
+    if var:
+        cf.customNamedValues.addOrSetValue('blend', spec.get('blend', 'smooth'))
+        cf.customNamedValues.addOrSetValue('stations', str(len(spec['stations'])))
+    else:
+        cf.customNamedValues.addOrSetValue('taperBy', spec.get('taperBy', 'angle'))
     return cf
 
 
@@ -1092,7 +1559,7 @@ class CreateExecute(adsk.core.CommandEventHandler):
         try:
             inputs = adsk.core.CommandEventArgs.cast(args).command.commandInputs
             sk = _in_sketch()
-            spec = _read_spec(inputs, sk)
+            spec = _read_any_spec(inputs, sk)
             des = adsk.fusion.Design.cast(app.activeProduct)
             if sk:
                 as_feature = adsk.core.BoolValueCommandInput.cast(inputs.itemById('asFeature')).value
@@ -1121,7 +1588,7 @@ class CreatePreview(adsk.core.CommandEventHandler):
             args = adsk.core.CommandEventArgs.cast(args)
             inputs = args.command.commandInputs
             sk = _in_sketch()
-            spec = _read_spec(inputs, sk)
+            spec = _read_any_spec(inputs, sk)
             if sk:
                 sk.sketchCurves.sketchFixedSplines.addByNurbsCurve(
                     build_curve(spec, PREVIEW_SAMPLES_PER_TURN))
@@ -1146,12 +1613,17 @@ class CreateDestroy(adsk.core.CommandEventHandler):
 
 
 class CreateCreated(adsk.core.CommandCreatedEventHandler):
+    def __init__(self, variable=False):
+        super().__init__()
+        self.variable = variable
+
     def notify(self, args):
         global _editing_deps, _touched, _touch_armed
         try:
             cmd = adsk.core.CommandCreatedEventArgs.cast(args).command
             _editing_deps, _touched, _touch_armed = {}, set(), True
-            _add_inputs(cmd.commandInputs, context='create', sketch=_in_sketch())
+            build = _add_var_inputs if self.variable else _add_inputs
+            build(cmd.commandInputs, context='create', sketch=_in_sketch())
             if not _in_sketch():
                 _show_origin(True)
             _wire(cmd, CreateExecute(), TriadActivate() if _in_sketch() else None, CreateDestroy(),
@@ -1177,7 +1649,7 @@ class EditExecute(adsk.core.CommandEventHandler):
     def notify(self, args):
         try:
             inputs = adsk.core.CommandEventArgs.cast(args).command.commandInputs
-            spec = _read_spec(inputs)
+            spec = _read_any_spec(inputs)
             cf = _editing
             # Grab the picks before the timeline moves; the inputs may not hold
             # them once their geometry is rolled away.
@@ -1210,6 +1682,8 @@ class EditExecute(adsk.core.CommandEventHandler):
                 for i in range(cf.dependencies.count)))
             cf.customNamedValues.addOrSetValue('hand', spec['hand'])
             cf.customNamedValues.addOrSetValue('flip', '1' if spec.get('flip') else '0')
+            if spec['mode'] == MODE_VAR:
+                cf.customNamedValues.addOrSetValue('blend', spec['blend'])
             for i in range(cf.parameters.count):
                 p = cf.parameters.item(i)
                 p.expression = spec['expr'][p.id]
@@ -1238,7 +1712,7 @@ class EditPreview(adsk.core.CommandEventHandler):
     def notify(self, args):
         try:
             inputs = adsk.core.CommandEventArgs.cast(args).command.commandInputs
-            spec = _read_spec(inputs)
+            spec = _read_any_spec(inputs)
             center, start = _effective_point(inputs, 'center'), _effective_point(inputs, 'start')
             _apply_points(_model_to_sketch(_editing_xf), spec, center, start)
             _attach_path(spec, _editing_xf, _effective_point(inputs, 'path'))
@@ -1337,7 +1811,8 @@ class EditCreated(adsk.core.CommandCreatedEventHandler):
             spec = _spec_of_feature(_editing)
             _editing_deps = {k: v for k, v in spec['_deps'].items() if v}
             _log('Helix3D edit open: stored ' + ', '.join('%s=%s' % (k, _describe(v)) for k, v in _editing_deps.items()))
-            _add_inputs(cmd.commandInputs, spec, context='edit_feature')
+            build = _add_var_inputs if spec['mode'] == MODE_VAR else _add_inputs
+            build(cmd.commandInputs, spec, context='edit_feature')
             _wire(cmd, EditExecute(), EditActivate(), EditDestroy(), EditPreview())
             h = EditPreSelect()
             cmd.preSelect.add(h)
@@ -1353,7 +1828,7 @@ class SketchEditExecute(adsk.core.CommandEventHandler):
     def notify(self, args):
         try:
             inputs = adsk.core.CommandEventArgs.cast(args).command.commandInputs
-            spec = _read_spec(inputs, _editing_curve.parentSketch)
+            spec = _read_any_spec(inputs, _editing_curve.parentSketch)
             _editing_curve.replaceGeometry(build_curve(spec))
             _store_spec_on_curve(_editing_curve, spec)
         except HelixError as e:
@@ -1366,7 +1841,7 @@ class SketchEditPreview(adsk.core.CommandEventHandler):
     def notify(self, args):
         try:
             args = adsk.core.CommandEventArgs.cast(args)
-            spec = _read_spec(args.command.commandInputs, _editing_curve.parentSketch)
+            spec = _read_any_spec(args.command.commandInputs, _editing_curve.parentSketch)
             # Coarse here, so dragging stays responsive; the execute handler
             # replaces this with the full rate curve when OK is pressed.
             _editing_curve.replaceGeometry(build_curve(spec, PREVIEW_SAMPLES_PER_TURN))
@@ -1421,7 +1896,8 @@ class SketchEditCreated(adsk.core.CommandCreatedEventHandler):
             spec = _spec_of_curve(curve)
             _editing_deps = {k: v for k, v in spec['_deps'].items() if v}
             _touched, _touch_armed, _editing_activated = set(), False, False
-            _add_inputs(cmd.commandInputs, spec, context='edit_sketch', sketch=curve.parentSketch)
+            build = _add_var_inputs if spec['mode'] == MODE_VAR else _add_inputs
+            build(cmd.commandInputs, spec, context='edit_sketch', sketch=curve.parentSketch)
             _wire(cmd, SketchEditExecute(), SketchEditActivate(), SketchEditDestroy(), SketchEditPreview())
         except Exception:
             ui.messageBox('Helix3D sketch edit command failed:\n' + traceback.format_exc())
@@ -1431,10 +1907,10 @@ class CommandTerminated(adsk.core.ApplicationCommandEventHandler):
     def notify(self, args):
         try:
             cid = adsk.core.ApplicationCommandEventArgs.cast(args).commandId
-            if cid in (CMD_ID, EDIT_ID, SKETCH_EDIT_ID, 'SelectCommand'):
+            if cid in OUR_COMMANDS or cid == 'SelectCommand':
                 return
             # Pan/orbit terminate too; don't touch the model under one of our dialogs.
-            if ui.activeCommand in (CMD_ID, EDIT_ID, SKETCH_EDIT_ID):
+            if ui.activeCommand in OUR_COMMANDS:
                 return
             _refresh_sketch_helices()
         except Exception:
@@ -1470,17 +1946,29 @@ def _button(cid, name, tip, handler):
 
 
 def run(context):
-    global _def
+    global _def, _def_var
     try:
         create_def = _button(CMD_ID, '3D Helix', 'Create a 3D helix or spiral sketch curve', CreateCreated())
         _button(EDIT_ID, 'Edit 3D Helix', 'Edit a parametric 3D helix', EditCreated())
         _button(SKETCH_EDIT_ID, 'Edit 3D Helix', 'Edit this helix curve', SketchEditCreated())
+        var_def = _button(VAR_CMD_ID, 'Variable Pitch Helix',
+                          'Create a helix whose pitch and radius change along its length, '
+                          'for progressive springs and timing screws',
+                          CreateCreated(variable=True))
+        _button(VAR_EDIT_ID, 'Edit Variable Pitch Helix',
+                'Edit a parametric variable pitch helix', EditCreated())
 
         # The edit command must exist before it is assigned to the definition.
         _def = adsk.fusion.CustomFeatureDefinition.create(CF_ID, 'Helix', ICONS)
         _def.editCommandId = EDIT_ID
         h = ComputeHandler()
         _def.customFeatureCompute.add(h)
+        _handlers.append(h)
+
+        _def_var = adsk.fusion.CustomFeatureDefinition.create(VAR_CF_ID, 'Variable Helix', ICONS)
+        _def_var.editCommandId = VAR_EDIT_ID
+        h = ComputeHandler()
+        _def_var.customFeatureCompute.add(h)
         _handlers.append(h)
 
         h = MarkingMenu()
@@ -1498,9 +1986,12 @@ def run(context):
 
         for pid in PANELS:
             panel = ui.allToolbarPanels.itemById(pid)
-            if panel and not panel.controls.itemById(CMD_ID):
-                ctrl = panel.controls.addCommand(create_def)
-                ctrl.isPromoted = True
+            if not panel:
+                continue
+            for cid, cdef in ((CMD_ID, create_def), (VAR_CMD_ID, var_def)):
+                if not panel.controls.itemById(cid):
+                    ctrl = panel.controls.addCommand(cdef)
+                    ctrl.isPromoted = True
     except Exception:
         ui.messageBox('Helix3D failed to start:\n' + traceback.format_exc())
 
@@ -1510,10 +2001,11 @@ def stop(context):
         app.unregisterCustomEvent(TOUCH_EVT)
         for pid in PANELS:
             panel = ui.allToolbarPanels.itemById(pid)
-            ctrl = panel.controls.itemById(CMD_ID) if panel else None
-            if ctrl:
-                ctrl.deleteMe()
-        for cid in (CMD_ID, EDIT_ID, SKETCH_EDIT_ID):
+            for cid in (CMD_ID, VAR_CMD_ID):
+                ctrl = panel.controls.itemById(cid) if panel else None
+                if ctrl:
+                    ctrl.deleteMe()
+        for cid in OUR_COMMANDS:
             d = ui.commandDefinitions.itemById(cid)
             if d:
                 d.deleteMe()

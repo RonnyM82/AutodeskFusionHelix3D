@@ -1,6 +1,6 @@
 # Autodesk Fusion Helix 3D Sketch Feature
 
-An Autodesk Fusion add-in that creates parametric 3D helix, spiral and along-a-path sketch curves.
+An Autodesk Fusion add-in that creates parametric 3D helix, variable pitch helix, spiral and along-a-path sketch curves.
 
 ![Every helix mode the add-in provides](docs/images/all-modes.png)
 
@@ -60,6 +60,21 @@ Same thing, but you say how many turns to fit along the path rather than the pit
 
 ![Helix wound around a circle for a set number of turns](docs/images/path-and-revolutions.png)
 
+### Variable Pitch
+
+This one is a second command, **Variable Pitch Helix**, for a helix whose pitch changes along its length. Fusion's Coil holds one pitch the whole way. Inventor's adds a transition and a flat end, which covers a closed-end spring and nothing else. This command takes a table instead.
+
+You give it a list of stations. Each station carries a pitch and a radius, and you say how many turns it takes to get to the next one. Pitch is the rise per turn, so the height is not something you type: it falls out of the table, and the dialog tells you what it came to.
+
+Two jobs it was built for:
+
+- **Progressive springs.** Start with a station at roughly the wire diameter, put the next one a turn later at the working pitch, and you have Inventor's transition and flat end. Give the active coils two different pitches and the rate climbs as the spring compresses.
+- **Timing screws** for packaging and conveying lines. Two stations at the same pitch hold a constant lead. A rising pair accelerates the containers apart. Two stations both at zero pitch give you a dwell, where the flight carries on round without advancing the container.
+
+**Blend** decides how the pitch gets from one station to the next. Smooth keeps the curvature continuous, so a section swept along the curve has no crease where the pitch changes. Linear ramps in a straight line, which is what SOLIDWORKS does, and leaves a small step in curvature at every station. Smooth is the default.
+
+Two stations at the same pitch give you an exactly constant run in between, with no sag or overshoot part way along. That is what makes the dwells and the straight sections come out the length you asked for.
+
 ### It is a real curve
 
 Nothing above is a picture of a coil. Sweep a section along one and you get a body like any other:
@@ -75,7 +90,7 @@ Nothing above is a picture of a coil. Sweep a section along one and you get a bo
 
    The zip already contains a folder called `Helix3D`, so extracting it puts everything where Fusion expects it. If you clone the repository instead, rename the folder to `Helix3D` so it matches `Helix3D.py` and `Helix3D.manifest`. Fusion will not see the add-in otherwise.
 3. In Fusion, go to **Utilities > Add-Ins**, find Helix3D on the Add-Ins tab, and run it. Tick "Run on Startup" if you want it back after a restart.
-4. The **3D Helix** command appears in the Sketch Create and Solid Create panels.
+4. The **3D Helix** and **Variable Pitch Helix** commands appear in the Sketch Create and Solid Create panels.
 
 IMPORTANT: if you change the manifest, restart Fusion completely. Fusion only reads it at startup, and a half-loaded add-in fails in ways that look like a bug in the command.
 
@@ -120,6 +135,8 @@ An in-sketch helix follows its inputs the same way a feature does: type an expre
 
 Radius, start angle and direction apply to all of them. Taper applies to everything except the flat spiral, which already works in start and end radii.
 
+**Variable Pitch Helix** is a separate command rather than a mode, because it asks for a table rather than a couple of numbers. It works the same way otherwise: a timeline feature outside a sketch, a curve with its definition on it inside one, and the same centre point, start point and placement triad.
+
 **Flip direction** runs the helix the other way: down the axis instead of up, or from the far end of the path back towards the start. It does not change whether the winding is right or left handed, so on a path helix with no taper and no change of radius there is nothing to see. Put a taper on it and the wide end swaps ends.
 
 ## Worth knowing
@@ -127,6 +144,9 @@ Radius, start angle and direction apply to all of them. Taper applies to everyth
 - The path modes take one curve at a time, a sketch curve or a body edge. Chained curves are not supported yet, so a path made of several joined segments needs to be one curve.
 - Wind a helix around a tight corner with a radius larger than the corner and it will pass through itself. That is the geometry, not a bug, but the add-in does not warn you about it.
 - A centre or start point has to come earlier in the timeline than the helix. Points that come later will not highlight when you try to pick them.
+- The number of stations on a variable pitch helix is fixed once you make it a feature, for the same reason Mode is: Fusion decides which parameters a custom feature owns when it is created. Changing the count means a new helix. In a sketch you can change it whenever you like.
+- On a variable pitch helix a start point sets the start angle and the height it starts at, but not the radius, because the radii come from the table.
+- Give a spring a pitch smaller than the wire you sweep along it and the coils will pass through each other. Same for a timing screw with a dwell narrower than the flight. The add-in does not check for it.
 - Developed against Fusion 2705.1.15 on Windows. It should be fine on Mac, I just have not tested it there.
 
 ## License

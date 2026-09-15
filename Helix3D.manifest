@@ -4,9 +4,9 @@
     "id": "e38cea06-648e-4a3d-aac2-e6085495807c",
     "author": "Scott Moyse - github.com/RonnyM82/AutodeskFusionHelix3D",
     "description": {
-        "": "Parametric 3D helix and spiral sketch curves. Source and releases: https://github.com/RonnyM82/AutodeskFusionHelix3D"
+        "": "Parametric 3D helix, variable pitch helix and spiral sketch curves. Source and releases: https://github.com/RonnyM82/AutodeskFusionHelix3D"
     },
-    "version": "0.7.7",
+    "version": "0.8.0",
     "runOnStartup": true,
     "supportedOS": "windows|mac",
     "editEnabled": true
