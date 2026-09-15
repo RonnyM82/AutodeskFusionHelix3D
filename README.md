@@ -24,4 +24,4 @@ Supported modes: Revolutions & Pitch, Revolutions & Height, Height & Pitch, Spir
 
 ## License
 
-No license specified — all rights reserved by the author unless otherwise agreed.
+MIT — see [LICENSE](LICENSE).
