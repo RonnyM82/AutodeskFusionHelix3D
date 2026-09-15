@@ -2,11 +2,11 @@
     "autodeskProduct": "Fusion",
     "type": "addin",
     "id": "e38cea06-648e-4a3d-aac2-e6085495807c",
-    "author": "Scott Moyse",
+    "author": "Scott Moyse - github.com/RonnyM82/AutodeskFusionHelix3D",
     "description": {
-        "": "Parametric 3D helix sketch curve as a custom feature"
+        "": "Parametric 3D helix and spiral sketch curves. Source and releases: https://github.com/RonnyM82/AutodeskFusionHelix3D"
     },
-    "version": "0.6.0",
+    "version": "0.6.1",
     "runOnStartup": true,
     "supportedOS": "windows|mac",
     "editEnabled": true
