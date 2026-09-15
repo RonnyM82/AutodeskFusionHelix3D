@@ -64,7 +64,7 @@ Same thing, but you say how many turns to fit along the path rather than the pit
 
 This one is a second command, **Variable Pitch Helix**, for a helix whose pitch changes along its length. Fusion's Coil holds one pitch the whole way. Inventor's adds a transition and a flat end, which covers a closed-end spring and nothing else. This command takes a table instead.
 
-You give it a list of stations. Each station carries a pitch and a radius, and you say how many turns it takes to get to the next one. Pitch is the rise per turn, so the height is not something you type: it falls out of the table, and the dialog tells you what it came to.
+You give it a table of stations. Station 1 is where the helix starts. Each row carries a pitch and a radius, and each row after the first says how many turns on from the row above it sits. Pitch is the rise per turn, so the height is not something you type: it falls out of the table, and the dialog tells you what it came to. Click a row, or type in one, and that part of the helix lights up orange in the preview so you can see which station you are on.
 
 Two jobs it was built for:
 

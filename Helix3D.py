@@ -80,6 +80,7 @@ LOG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'Helix3D.log
 SETTINGS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'Helix3D.settings.json')
 _triad_last = None      # last meaningful triad transform (world); restored when the triad is re-shown
 _seeded_end_radius = False  # end radius pre-filled from the radius once per dialog
+_var_focus = None       # ('station', k) or ('span', k): the part of the helix the dialog is on
 
 
 def _load_settings():
@@ -435,11 +436,13 @@ def var_helix_height(stations, smooth=True):
 
 
 def var_helix_nurbs(stations, start_ang, right_hand, smooth=True, flip=False,
-                    per_turn=SAMPLES_PER_TURN):
+                    per_turn=SAMPLES_PER_TURN, u_range=None):
     """Control points and knots for a helix around Z whose pitch and radius
     follow the stations. Pitch is rise per turn, so the height is the area under
     the pitch. The pitch is smooth in slope, which makes the height smooth in
-    curvature, and that is what stops a sweep creasing at a station."""
+    curvature, and that is what stops a sweep creasing at a station.
+    u_range=(from, to) in turns builds just that stretch, for the preview
+    highlight."""
     xs, ps, rs = _station_axes(stations)
     pitch, radius = _Ramp(xs, ps, smooth), _Ramp(xs, rs, smooth)
     sign = -1.0 if flip else 1.0
@@ -457,11 +460,16 @@ def var_helix_nurbs(stations, start_ang, right_hand, smooth=True, flip=False,
                 dr * math.sin(a) + r * math.cos(a) * rate,
                 sign * pitch.value(u))
 
-    # Sample each span on its own so a sample lands exactly on every station.
-    us = [0.0]
-    for i in range(len(xs) - 1):
-        k = _sample_count(xs[i + 1] - xs[i], per_turn)
-        us.extend(xs[i] + (xs[i + 1] - xs[i]) * j / k for j in range(1, k + 1))
+    if u_range is not None:
+        u0, u1 = max(u_range[0], 0.0), min(u_range[1], xs[-1])
+        k = _sample_count(u1 - u0, per_turn)
+        us = [u0 + (u1 - u0) * j / k for j in range(k + 1)]
+    else:
+        # Sample each span on its own so a sample lands exactly on every station.
+        us = [0.0]
+        for i in range(len(xs) - 1):
+            k = _sample_count(xs[i + 1] - xs[i], per_turn)
+            us.extend(xs[i] + (xs[i + 1] - xs[i]) * j / k for j in range(1, k + 1))
     # The fit runs on 0..1, so the end tangents have to be per unit of that, not
     # per turn. Getting this wrong costs three hundred times the radial error.
     span = us[-1] - us[0]
@@ -820,22 +828,36 @@ def _blend_of(inputs):
 
 
 def _add_var_inputs(inputs, spec=None, context='create', sketch=None):
-    """The variable pitch dialog: a station count, a blend, and a table of
-    turns / pitch / radius, plus the placement the other dialog uses."""
-    global _pending_selections
-    _pending_selections = []
+    """The variable pitch dialog, in three groups: where the helix sits, the
+    station table, and how it winds. Pickers first, so selection runs top to
+    bottom the way it does in the other dialog."""
+    global _pending_selections, _var_focus
+    _pending_selections, _var_focus = [], None
     lu = app.activeProduct.unitsManager.defaultLengthUnits
     spec = spec or {}
     stations = spec.get('stations') or _default_stations()
     n = max(2, min(MAX_STATIONS, len(stations)))
 
-    cnt = inputs.addIntegerSpinnerCommandInput('stations', 'Stations', 2, MAX_STATIONS, 1, n)
+    pos = inputs.addGroupCommandInput('position_grp', 'Position')
+    pos.isExpanded = True
+    pos.tooltip = 'Where the helix sits. Pick nothing and it starts at the origin of the sketch plane.'
+    _add_pickers(pos.children, spec, context, with_path=False,
+                 start_tip='Optional. Where the helix starts: sets the start angle and the '
+                           'height it starts at. The radii come from the table.')
+    _add_placement(pos.children, spec, sketch)
+
+    grp = inputs.addGroupCommandInput('stations_grp', 'Stations')
+    grp.isExpanded = True
+    grp.tooltip = ('Station 1 is where the helix starts. Each row after it says how many '
+                   'turns on from the row above it sits, and the pitch and radius there. '
+                   'Click a row to see where it is on the preview.')
+    ch = grp.children
+    cnt = ch.addIntegerSpinnerCommandInput('stations', 'Stations', 2, MAX_STATIONS, 1, n)
     cnt.isEnabled = context != 'edit_feature'   # a feature's parameters are fixed
     cnt.tooltip = ('How many points along the helix you set a pitch and a radius at. '
                    'Fusion fixes which parameters a custom feature owns when it is '
                    'created, so this is greyed out when you edit one.')
-
-    bl = inputs.addDropDownCommandInput('blend', 'Blend', adsk.core.DropDownStyles.TextListDropDownStyle)
+    bl = ch.addDropDownCommandInput('blend', 'Blend', adsk.core.DropDownStyles.TextListDropDownStyle)
     cur_blend = spec.get('blend', 'smooth')
     for label, key in BLENDS:
         bl.listItems.add(label, key == cur_blend)
@@ -843,59 +865,131 @@ def _add_var_inputs(inputs, spec=None, context='create', sketch=None):
                   'curvature continuous, so a sweep along it has no crease at a station. '
                   'Linear ramps in a straight line, which is what SOLIDWORKS does.')
 
-    table = inputs.addTableCommandInput('table', 'Stations', 3, '1:1:1')
-    table.minimumVisibleRows = 4
+    table = ch.addTableCommandInput('table', 'Stations', 4, '2:3:3:3')
+    table.minimumVisibleRows = 3
     table.maximumVisibleRows = MAX_STATIONS + 1
     table.tablePresentationStyle = adsk.core.TablePresentationStyles.itemBorderTablePresentationStyle
     tc = table.commandInputs
-    for hid, label in (('h_turns', 'Turns to next'), ('h_pitch', 'Pitch'), ('h_radius', 'Radius')):
+    for hid, label in (('h_station', 'Station'), ('h_turns', 'Turns from previous'),
+                       ('h_pitch', 'Pitch'), ('h_radius', 'Radius')):
         tc.addTextBoxCommandInput(hid, '', '<b>%s</b>' % label, 1, True)
+    tc.addTextBoxCommandInput('t_start', '', 'start', 1, True)
+    # Every cell that could ever be needed exists from the start; the table
+    # shows the ones in use. turns<k> is the gap after station k, shown on the
+    # row of station k+1 so that reading down each row says how far on it is.
     for i in range(MAX_STATIONS):
         src = stations[i] if i < len(stations) else stations[-1]
         k = i + 1
+        tc.addTextBoxCommandInput('s%d' % k, '', '<b>%d</b>' % k, 1, True)
         tc.addValueInput('turns%d' % k, 'Turns', '', _seed(spec, 'turns%d' % k, src.get('turns', 1.0)))
         tc.addValueInput('pitch%d' % k, 'Pitch', lu, _seed(spec, 'pitch%d' % k, src.get('pitch', 1.0)))
         tc.addValueInput('radius%d' % k, 'Radius', lu, _seed(spec, 'radius%d' % k, src.get('radius', 2.0)))
+    tb = ch.addTextBoxCommandInput('readout', '', '', 1, True)
+    tb.isFullWidth = True
 
-    _add_pickers(inputs, spec, context, with_path=False,
-                 start_tip='Optional. Where the helix starts: sets the start angle and the '
-                           'height it starts at. The radii come from the table.')
-    if context == 'create' and _in_sketch():
-        inputs.addBoolValueInput('asFeature', 'Finish sketch and create parametric feature', True, '', False)
-
-    inputs.addValueInput('startAngle', 'Start Angle', 'deg', _seed(spec, 'startAngle', 0.0))
-    hd = inputs.addDropDownCommandInput('hand', 'Direction', adsk.core.DropDownStyles.TextListDropDownStyle)
+    wnd = inputs.addGroupCommandInput('winding_grp', 'Winding')
+    wnd.isExpanded = True
+    wc = wnd.children
+    wc.addValueInput('startAngle', 'Start Angle', 'deg', _seed(spec, 'startAngle', 0.0))
+    hd = wc.addDropDownCommandInput('hand', 'Direction', adsk.core.DropDownStyles.TextListDropDownStyle)
     rh = spec.get('hand', 'right') == 'right'
     hd.listItems.add('Right hand', rh)
     hd.listItems.add('Left hand', not rh)
-    fl = inputs.addBoolValueInput('flip', 'Flip direction', True, '', bool(spec.get('flip')))
+    fl = wc.addBoolValueInput('flip', 'Flip direction', True, '', bool(spec.get('flip')))
     fl.tooltip = ('Run the helix down the axis instead of up. The winding stays right or '
                   'left handed either way, and the stations stay in the order you typed.')
 
-    _add_placement(inputs, spec, sketch)
-    tb = inputs.addTextBoxCommandInput('readout', '', '', 1, True)
-    tb.isFullWidth = True
+    if context == 'create' and _in_sketch():
+        inputs.addBoolValueInput('asFeature', 'Finish sketch and create parametric feature', True, '', False)
+
     _rebuild_station_table(inputs)
     _apply_var_visibility(inputs)
     _update_var_readout(inputs)
 
 
+def _size_var_dialog(cmd):
+    """The station table needs more width than Fusion gives a dialog by default."""
+    try:
+        cmd.setDialogInitialSize(520, 700)
+        cmd.setDialogMinimumSize(460, 360)
+    except Exception:
+        _log('Helix3D could not size the dialog:\n' + traceback.format_exc())
+
+
 def _rebuild_station_table(inputs):
     """Show exactly as many rows as the station count asks for. The cells all
-    exist already; the table just holds the ones in use, so changing the count
-    keeps whatever was typed."""
+    exist already, so changing the count keeps whatever was typed. A cell that
+    is not in a row gets drawn as a loose input under the table, so everything
+    not in use is hidden."""
     table = adsk.core.TableCommandInput.cast(inputs.itemById('table'))
     n = adsk.core.IntegerSpinnerCommandInput.cast(inputs.itemById('stations')).value
     tc = table.commandInputs
     table.clear()
-    for c, hid in enumerate(('h_turns', 'h_pitch', 'h_radius')):
-        table.addCommandInput(tc.itemById(hid), 0, c)
-    for i in range(n):
-        k = i + 1
-        if i < n - 1:      # the last station has nothing after it to run to
-            table.addCommandInput(tc.itemById('turns%d' % k), k, 0)
-        table.addCommandInput(tc.itemById('pitch%d' % k), k, 1)
-        table.addCommandInput(tc.itemById('radius%d' % k), k, 2)
+    placed = set()
+
+    def put(cid, row, col):
+        inp = tc.itemById(cid)
+        table.addCommandInput(inp, row, col)
+        inp.isVisible = True
+        placed.add(cid)
+
+    for c, hid in enumerate(('h_station', 'h_turns', 'h_pitch', 'h_radius')):
+        put(hid, 0, c)
+    for k in range(1, n + 1):
+        put('s%d' % k, k, 0)
+        put('t_start' if k == 1 else 'turns%d' % (k - 1), k, 1)
+        put('pitch%d' % k, k, 2)
+        put('radius%d' % k, k, 3)
+    for i in range(tc.count):
+        inp = tc.item(i)
+        if inp.id not in placed:
+            inp.isVisible = False
+
+
+def _var_focus_range(spec):
+    """(from, to) in turns for the part of the helix the dialog is on, or None."""
+    if not _var_focus or spec.get('mode') != MODE_VAR:
+        return None
+    xs, _, _ = _station_axes(spec['stations'])
+    kind, k = _var_focus
+    if kind == 'span':                      # the run from station k to k+1
+        if 1 <= k < len(xs):
+            return xs[k - 1], xs[k]
+    elif 1 <= k <= len(xs):                 # a third of a turn either side of station k
+        c = xs[k - 1]
+        return max(0.0, c - 0.35), min(xs[-1], c + 0.35)
+    return None
+
+
+def _build_highlight(spec):
+    """The highlighted stretch as a curve in sketch space, or None."""
+    rng = _var_focus_range(spec)
+    if not rng or rng[1] - rng[0] <= 1e-9:
+        return None
+    P, U = var_helix_nurbs(spec['stations'], spec['startAngle'], spec['hand'] == 'right',
+                           spec.get('blend', 'smooth') == 'smooth', bool(spec.get('flip')),
+                           PREVIEW_SAMPLES_PER_TURN, rng)
+    return _curve_from(P, U, spec.get('xform'))
+
+
+def _show_highlight(spec, comp, xf):
+    """Orange overlay on the part of the helix the dialog is on. Lives in the
+    preview transaction with everything else, so it goes when the dialog does."""
+    try:
+        curve = _build_highlight(spec)
+    except HelixError:
+        return
+    if curve is None:
+        return
+    curve.transformBy(xf)
+    g = comp.customGraphicsGroups.add()
+    c = g.addCurve(curve)
+    c.weight = 5
+    c.color = adsk.fusion.CustomGraphicsSolidColorEffect.create(adsk.core.Color.create(255, 140, 0, 255))
+    try:
+        c.depthPriority = 1     # over the curve it sits on
+    except Exception:
+        pass
 
 
 def _apply_var_visibility(inputs):
@@ -1409,8 +1503,19 @@ class InputChanged(adsk.core.InputChangedEventHandler):
             if cid == 'center':
                 _triad_follow_center(inputs)
             if inputs.itemById('stations'):      # the variable pitch dialog
+                global _var_focus
+                base = cid.rstrip('0123456789')
                 if cid == 'stations':
                     _rebuild_station_table(inputs)
+                    _var_focus = None
+                elif cid == 'table':                # a row was clicked
+                    row = adsk.core.TableCommandInput.cast(args.input).selectedRow
+                    if row >= 1:
+                        _var_focus = ('station', row)
+                elif base != cid and base in ('pitch', 'radius'):
+                    _var_focus = ('station', int(cid[len(base):]))
+                elif base != cid and base == 'turns':
+                    _var_focus = ('span', int(cid[len(base):]))
                 _apply_var_visibility(inputs)
                 _update_var_readout(inputs)
                 _advance_focus(inputs, cid)
@@ -1593,11 +1698,13 @@ class CreatePreview(adsk.core.CommandEventHandler):
             if sk:
                 sk.sketchCurves.sketchFixedSplines.addByNurbsCurve(
                     build_curve(spec, PREVIEW_SAMPLES_PER_TURN))
+                _show_highlight(spec, sk.parentComponent, sk.transform)
                 return
             comp = adsk.fusion.Design.cast(app.activeProduct).activeComponent
             plane, center_ent, start_ent, path_ent = _feature_placement(inputs, comp)
-            _create_sketch(comp, plane, spec, center_ent, start_ent, path_ent,
-                           PREVIEW_SAMPLES_PER_TURN)
+            psk = _create_sketch(comp, plane, spec, center_ent, start_ent, path_ent,
+                                 PREVIEW_SAMPLES_PER_TURN)
+            _show_highlight(spec, comp, psk.transform)
         except HelixError:
             pass   # nothing to preview yet (no path picked)
         except Exception:
@@ -1625,6 +1732,8 @@ class CreateCreated(adsk.core.CommandCreatedEventHandler):
             _editing_deps, _touched, _touch_armed = {}, set(), True
             build = _add_var_inputs if self.variable else _add_inputs
             build(cmd.commandInputs, context='create', sketch=_in_sketch())
+            if self.variable:
+                _size_var_dialog(cmd)
             if not _in_sketch():
                 _show_origin(True)
             _wire(cmd, CreateExecute(), TriadActivate() if _in_sketch() else None, CreateDestroy(),
@@ -1729,6 +1838,7 @@ class EditPreview(adsk.core.CommandEventHandler):
                 sk.isVisible = False
             curve.transformBy(_editing_xf)
             _draw_preview(_editing.parentComponent, curve)
+            _show_highlight(spec, _editing.parentComponent, _editing_xf)
         except Exception:
             _log('Helix3D edit preview failed:\n' + traceback.format_exc())
 
@@ -1814,6 +1924,8 @@ class EditCreated(adsk.core.CommandCreatedEventHandler):
             _log('Helix3D edit open: stored ' + ', '.join('%s=%s' % (k, _describe(v)) for k, v in _editing_deps.items()))
             build = _add_var_inputs if spec['mode'] == MODE_VAR else _add_inputs
             build(cmd.commandInputs, spec, context='edit_feature')
+            if spec['mode'] == MODE_VAR:
+                _size_var_dialog(cmd)
             _wire(cmd, EditExecute(), EditActivate(), EditDestroy(), EditPreview())
             h = EditPreSelect()
             cmd.preSelect.add(h)
@@ -1846,6 +1958,8 @@ class SketchEditPreview(adsk.core.CommandEventHandler):
             # Coarse here, so dragging stays responsive; the execute handler
             # replaces this with the full rate curve when OK is pressed.
             _editing_curve.replaceGeometry(build_curve(spec, PREVIEW_SAMPLES_PER_TURN))
+            psk = _editing_curve.parentSketch
+            _show_highlight(spec, psk.parentComponent, psk.transform)
         except HelixError:
             pass
         except Exception:
@@ -1899,6 +2013,8 @@ class SketchEditCreated(adsk.core.CommandCreatedEventHandler):
             _touched, _touch_armed, _editing_activated = set(), False, False
             build = _add_var_inputs if spec['mode'] == MODE_VAR else _add_inputs
             build(cmd.commandInputs, spec, context='edit_sketch', sketch=curve.parentSketch)
+            if spec['mode'] == MODE_VAR:
+                _size_var_dialog(cmd)
             _wire(cmd, SketchEditExecute(), SketchEditActivate(), SketchEditDestroy(), SketchEditPreview())
         except Exception:
             ui.messageBox('Helix3D sketch edit command failed:\n' + traceback.format_exc())
