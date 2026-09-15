@@ -36,6 +36,7 @@ PANELS = ('SketchCreatePanel', 'SolidCreatePanel')
 ICONS = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'resources')
 ATTR_GROUP = 'Helix3D'
 SAMPLES_PER_TURN = 24
+PREVIEW_SAMPLES_PER_TURN = 12   # previews only have to look right; see build_curve
 
 MODES = ['Revolutions & Pitch', 'Revolutions & Height', 'Height & Pitch', 'Spiral (flat)',
          'Path & Pitch', 'Path & Revolutions']
@@ -208,14 +209,14 @@ def _rmf(samples, up):
 
 
 def path_helix_nurbs(sampler, r0, dr, turns, start_ang, right_hand, up, per_turn=SAMPLES_PER_TURN):
-    """Helix wound around a path. sampler(t) -> (point, tangent) at fraction t
-    of the path's arc length; everything in the sampler's coordinate space."""
+    """Helix wound around a path. sampler(ts) -> [(point, tangent), ...] at
+    those fractions of the path's arc length, in the sampler's own space."""
     n = _sample_count(turns, per_turn)
     d = 0.1 / n   # two extra samples at each end for second-order end tangents
     ts = [0.0, d, 2 * d] + [k / n for k in range(1, n)] + [1.0 - 2 * d, 1.0 - d, 1.0]
     total_ang = 2 * math.pi * turns * (1 if right_hand else -1)
     Q = []
-    for t, (p, tv, r, b) in zip(ts, _rmf([sampler(t) for t in ts], up)):
+    for t, (p, tv, r, b) in zip(ts, _rmf(sampler(ts), up)):
         a = start_ang + total_ang * t
         rad = r0 + dr * t
         Q.append(tuple(p[c] + rad * (math.cos(a) * r[c] + math.sin(a) * b[c]) for c in range(3)))
@@ -239,39 +240,61 @@ def _fit_nurbs(Q, D0, Dn):
     P[1] = tuple(Q[0][c] + U[4] / 3.0 * D0[c] for c in range(3))
     P[m - 2] = tuple(Q[n][c] - (1 - U[m - 1]) / 3.0 * Dn[c] for c in range(3))
 
+    # Only four basis functions are non-zero at any u, so each row of the
+    # interpolation matrix has at most four entries, all close to the diagonal.
+    # Storing and solving just that band keeps a 24 turn helix quick; solving it
+    # as a dense matrix costs the square of the sample count.
     nu = n - 1
-    A = [[0.0] * nu for _ in range(nu)]
+    rows = []
     rhs = [[0.0] * 3 for _ in range(nu)]
+    half = 0
     for r in range(nu):
         u = uk[r + 1]
         span = _find_span(m - 1, p, u, U)
         N = _basis_funs(span, u, p, U)
+        cols = {}
         for j in range(p + 1):
             idx = span - p + j
             if idx <= 1 or idx >= m - 2:
                 for c in range(3):
                     rhs[r][c] -= N[j] * P[idx][c]
             else:
-                A[r][idx - 2] += N[j]
+                cols[idx - 2] = cols.get(idx - 2, 0.0) + N[j]
         for c in range(3):
             rhs[r][c] += Q[r + 1][c]
+        rows.append(cols)
+        for col in cols:
+            half = max(half, abs(col - r))
+
+    band = [[0.0] * (2 * half + 1) for _ in range(nu)]
+    for r, cols in enumerate(rows):
+        for col, value in cols.items():
+            band[r][col - r + half] = value
+
+    # No row swapping: this matrix is diagonally dominant, and swapping rows
+    # would spread entries outside the band.
     for i in range(nu):
-        piv = max(range(i, nu), key=lambda k: abs(A[k][i]))
-        A[i], A[piv] = A[piv], A[i]
-        rhs[i], rhs[piv] = rhs[piv], rhs[i]
-        for k in range(i + 1, nu):
-            f = A[k][i] / A[i][i]
-            if f == 0:
+        piv = band[i][half]
+        top = min(i + half, nu - 1)
+        for k in range(i + 1, top + 1):
+            f = band[k][half - (k - i)]
+            if f == 0.0:
                 continue
-            for j in range(i, nu):
-                A[k][j] -= f * A[i][j]
+            f /= piv
+            for col in range(i, top + 1):
+                band[k][col - k + half] -= f * band[i][col - i + half]
             for c in range(3):
                 rhs[k][c] -= f * rhs[i][c]
+
     X = [[0.0] * 3 for _ in range(nu)]
     for i in range(nu - 1, -1, -1):
+        top = min(i + half, nu - 1)
+        d = band[i][half]
         for c in range(3):
-            s = rhs[i][c] - sum(A[i][j] * X[j][c] for j in range(i + 1, nu))
-            X[i][c] = s / A[i][i]
+            s = rhs[i][c]
+            for j in range(i + 1, top + 1):
+                s -= band[i][j - i + half] * X[j][c]
+            X[i][c] = s / d
     for i in range(nu):
         P[i + 2] = tuple(X[i])
     return P, U
@@ -302,20 +325,22 @@ def resolve(spec):
     return r0, dr, height, turns
 
 
-def build_curve(spec):
-    """NurbsCurve3D in sketch space from a spec dict."""
+def build_curve(spec, per_turn=SAMPLES_PER_TURN):
+    """NurbsCurve3D in sketch space from a spec dict. per_turn is dropped for
+    previews, where the curve only has to look right; everything that gets
+    committed is built at the full sample rate."""
     if spec['mode'] in PATH_MODES:
         if not spec.get('_sampler'):
             raise HelixError('Pick a path for the helix to follow.')
         r0, dr, height, turns = resolve(spec)
         P, U = path_helix_nurbs(spec['_sampler'], r0, dr, turns, spec['startAngle'],
-                                spec['hand'] == 'right', spec['_up'])
+                                spec['hand'] == 'right', spec['_up'], per_turn)
         pts = [adsk.core.Point3D.create(*p) for p in P]
         for pt in pts:
             pt.transformBy(spec['_Si'])   # path is sampled in model space
         return adsk.core.NurbsCurve3D.createNonRational(pts, 3, U, False)
     r0, dr, height, turns = resolve(spec)
-    P, U = helix_nurbs(r0, dr, height, turns, spec['startAngle'], spec['hand'] == 'right')
+    P, U = helix_nurbs(r0, dr, height, turns, spec['startAngle'], spec['hand'] == 'right', per_turn)
     pts = [adsk.core.Point3D.create(*p) for p in P]
     xf = spec.get('xform')
     if xf:
@@ -337,17 +362,24 @@ def _path_geometry(ent):
 
 
 def _path_sampler(curve3d):
-    """(sampler, length): sampler(t) gives (point, tangent) at fraction t of
-    the arc length, in the curve's own (model) space."""
+    """(sampler, length): sampler(ts) gives [(point, tangent), ...] at those
+    fractions of the arc length, in the curve's own (model) space. Points and
+    derivatives come back one call each, because a round trip into Fusion per
+    sample is what makes a long path slow to preview."""
     ev = curve3d.evaluator
     _, pmin, pmax = ev.getParameterExtents()
     _, length = ev.getLengthAtParameter(pmin, pmax)
 
-    def sample(t):
-        _, u = ev.getParameterAtLength(pmin, min(max(t, 0.0), 1.0) * length)
-        _, p = ev.getPointAtParameter(u)
-        _, d = ev.getFirstDerivative(u)
-        return (p.x, p.y, p.z), (d.x, d.y, d.z)
+    def sample(ts):
+        params = []
+        for t in ts:
+            _, u = ev.getParameterAtLength(pmin, min(max(t, 0.0), 1.0) * length)
+            params.append(u)
+        got_points, points = ev.getPointsAtParameters(params)
+        got_derivs, derivs = ev.getFirstDerivatives(params)
+        if not (got_points and got_derivs):
+            raise HelixError('Could not evaluate that path curve.')
+        return [((p.x, p.y, p.z), (d.x, d.y, d.z)) for p, d in zip(points, derivs)]
     return sample, length
 
 
@@ -968,12 +1000,13 @@ def _wire(cmd, execute_handler, activate=None, destroy=None, preview=None):
 # --------------------------------------------------------------------------
 # Create command
 # --------------------------------------------------------------------------
-def _create_sketch(comp, plane, spec, center_ent=None, start_ent=None, path_ent=None):
+def _create_sketch(comp, plane, spec, center_ent=None, start_ent=None, path_ent=None,
+                   per_turn=SAMPLES_PER_TURN):
     sk = comp.sketches.add(plane)
     sk.name = 'Helix'
     _apply_points(_model_to_sketch(sk.transform), spec, center_ent, start_ent)
     _attach_path(spec, sk.transform, path_ent)
-    sk.sketchCurves.sketchFixedSplines.addByNurbsCurve(build_curve(spec))
+    sk.sketchCurves.sketchFixedSplines.addByNurbsCurve(build_curve(spec, per_turn))
     return sk
 
 
@@ -1050,14 +1083,13 @@ class CreatePreview(adsk.core.CommandEventHandler):
             sk = _in_sketch()
             spec = _read_spec(inputs, sk)
             if sk:
-                curve = sk.sketchCurves.sketchFixedSplines.addByNurbsCurve(build_curve(spec))
-                if not adsk.core.BoolValueCommandInput.cast(inputs.itemById('asFeature')).value:
-                    _store_spec_on_curve(curve, spec)
-                    args.isValidResult = True
+                sk.sketchCurves.sketchFixedSplines.addByNurbsCurve(
+                    build_curve(spec, PREVIEW_SAMPLES_PER_TURN))
                 return
             comp = adsk.fusion.Design.cast(app.activeProduct).activeComponent
             plane, center_ent, start_ent, path_ent = _feature_placement(inputs, comp)
-            _create_sketch(comp, plane, spec, center_ent, start_ent, path_ent)
+            _create_sketch(comp, plane, spec, center_ent, start_ent, path_ent,
+                           PREVIEW_SAMPLES_PER_TURN)
         except HelixError:
             pass   # nothing to preview yet (no path picked)
         except Exception:
@@ -1173,7 +1205,7 @@ class EditPreview(adsk.core.CommandEventHandler):
                  % (_describe(_picked(inputs, 'center')), _describe(_picked(inputs, 'start')),
                     _describe(center), _describe(start), spec['radius']))
             try:
-                curve = build_curve(spec)
+                curve = build_curve(spec, PREVIEW_SAMPLES_PER_TURN)
             except HelixError:
                 return
             sk = _sketch_of(_editing)
@@ -1293,9 +1325,9 @@ class SketchEditPreview(adsk.core.CommandEventHandler):
         try:
             args = adsk.core.CommandEventArgs.cast(args)
             spec = _read_spec(args.command.commandInputs, _editing_curve.parentSketch)
-            _editing_curve.replaceGeometry(build_curve(spec))
-            _store_spec_on_curve(_editing_curve, spec)
-            args.isValidResult = True   # preview is the final result; execute is skipped
+            # Coarse here, so dragging stays responsive; the execute handler
+            # replaces this with the full rate curve when OK is pressed.
+            _editing_curve.replaceGeometry(build_curve(spec, PREVIEW_SAMPLES_PER_TURN))
         except HelixError:
             pass
         except Exception:
