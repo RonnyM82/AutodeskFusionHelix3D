@@ -881,7 +881,9 @@ def _add_var_inputs(inputs, spec=None, context='create', sketch=None):
     grp.isExpanded = True
     grp.tooltip = ('Station 1 is where the helix starts. Each row after it says how many '
                    'turns on from the row above it sits, and the pitch and radius there. '
-                   'Click into a row and the run it describes lights up on the preview.')
+                   'Click into a row and the stretch of helix nearest that station lights '
+                   'up on the preview; type in a turns cell and it lights the run that '
+                   'number measures.')
     ch = grp.children
     cnt = ch.addIntegerSpinnerCommandInput('stations', 'Stations', 2, MAX_STATIONS, 1, n)
     cnt.isEnabled = context != 'edit_feature'   # a feature's parameters are fixed
@@ -1001,26 +1003,38 @@ def _rebuild_station_table(inputs):
 
 def _var_focus_range(spec):
     """(from, to) in turns for the part of the helix the dialog is on, or None.
-    A row lights the run from the station above down to its own station; the
-    ends light their flat and transition, or a short stretch if natural."""
+
+    A row owns the stretch of curve nearest its own station: half way back to
+    the station above, half way on to the one below, and out to the end of the
+    curve at the two ends. The rows tile the whole helix between them, so the
+    first and last light up about as much as each other. Lighting the run above
+    each station instead left the first row with nothing to show, since it has
+    no station above it.
+
+    A turns cell is different: it lights the run it actually measures, from the
+    station above down to its own."""
     if not _var_focus or spec.get('mode') != MODE_VAR:
         return None
     xs, _, _ = _station_axes(_expanded_stations(spec))
     o = 2 if spec.get('startType') == 'flat' else 0      # user station k sits at xs[k-1+o]
     n = len(spec['stations'])
-    head = (0.0, xs[o] if o else min(0.35, xs[-1]))
+    at = lambda k: xs[k - 1 + o]
+    mid = lambda a, b: (at(a) + at(b)) / 2.0
     kind = _var_focus[0]
     if kind == 'row':
         k = _var_focus[1]
-        if k == 1:
-            return head
-        if 2 <= k <= n:
-            return xs[k - 2 + o], xs[k - 1 + o]
+        if 1 <= k <= n:
+            return (0.0 if k == 1 else mid(k - 1, k),
+                    xs[-1] if k == n else mid(k, k + 1))
+    elif kind == 'span':                                 # a turns cell
+        j = _var_focus[1]
+        if 1 <= j < n:
+            return at(j), at(j + 1)
     elif kind == 'start':
-        return head
+        return (0.0, at(1)) if o else (0.0, min(0.35, xs[-1]))
     elif kind == 'end':
         if spec.get('endType') == 'flat':
-            return xs[n - 1 + o], xs[-1]
+            return at(n), xs[-1]
         return max(0.0, xs[-1] - 0.35), xs[-1]
     return None
 
@@ -1034,6 +1048,13 @@ def _build_highlight(spec):
                            spec.get('blend', 'smooth') == 'smooth', bool(spec.get('flip')),
                            PREVIEW_SAMPLES_PER_TURN, rng)
     return _curve_from(P, U, spec.get('xform'))
+
+
+def _selected_row(inputs):
+    """The table row the user is in, so a value typed into a cell does not get
+    overwritten by the row watcher a moment later."""
+    table = adsk.core.TableCommandInput.cast(_find(inputs, 'table'))
+    return table.selectedRow if table else -2
 
 
 class VarPoll(adsk.core.CustomEventHandler):
@@ -1687,8 +1708,10 @@ class InputChanged(adsk.core.InputChangedEventHandler):
                         _var_focus, _var_last_row = ('row', row), row
                 elif base != cid and base in ('pitch', 'radius'):
                     _var_focus = ('row', int(cid[len(base):]))
-                elif base != cid and base == 'turns':   # the gap after station j is on row j+1
-                    _var_focus = ('row', int(cid[len(base):]) + 1)
+                    _var_last_row = _selected_row(inputs)
+                elif base != cid and base == 'turns':   # turns<j> runs station j to j+1
+                    _var_focus = ('span', int(cid[len(base):]))
+                    _var_last_row = _selected_row(inputs)
                 elif cid.startswith('start') and cid != 'startAngle':
                     _var_focus = ('start',)
                 elif cid.startswith('end'):
