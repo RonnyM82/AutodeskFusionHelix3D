@@ -37,8 +37,15 @@ ICONS = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'resources')
 ATTR_GROUP = 'Helix3D'
 SAMPLES_PER_TURN = 24
 
-MODES = ['Revolutions & Pitch', 'Revolutions & Height', 'Height & Pitch', 'Spiral (flat)']
-MODE_RP, MODE_RH, MODE_HP, MODE_SPIRAL = MODES
+MODES = ['Revolutions & Pitch', 'Revolutions & Height', 'Height & Pitch', 'Spiral (flat)',
+         'Path & Pitch', 'Path & Revolutions']
+MODE_RP, MODE_RH, MODE_HP, MODE_SPIRAL, MODE_PP, MODE_PR = MODES
+PATH_MODES = (MODE_PP, MODE_PR)
+PICKERS = ('plane', 'path', 'center', 'start')   # dialog order; selection focus walks along it
+
+
+class HelixError(Exception):
+    """A message for the user, not a traceback."""
 
 _handlers = []
 _def = None
@@ -60,6 +67,7 @@ _pending_selections = []  # [(input id, entity)] to select once the dialog activ
 LOG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'Helix3D.log')
 SETTINGS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'Helix3D.settings.json')
 _triad_last = None      # last meaningful triad transform (world); restored when the triad is re-shown
+_seeded_end_radius = False  # end radius pre-filled from the radius once per dialog
 
 
 def _load_settings():
@@ -124,10 +132,14 @@ def _find_span(n, p, u, U):
     return mid
 
 
+def _sample_count(turns, per_turn):
+    return max(6, int(math.ceil(abs(turns) * per_turn)))
+
+
 def helix_nurbs(r0, dr, height, turns, start_ang, right_hand, per_turn=SAMPLES_PER_TURN):
     """Control points and knots for a cubic B-spline helix around Z, centred on
     the origin, starting at z=0. Radius varies linearly from r0 to r0+dr."""
-    n = max(6, int(math.ceil(abs(turns) * per_turn)))
+    n = _sample_count(turns, per_turn)
     total_ang = 2 * math.pi * turns * (1 if right_hand else -1)
 
     def pt(t):
@@ -142,8 +154,83 @@ def helix_nurbs(r0, dr, height, turns, start_ang, right_hand, per_turn=SAMPLES_P
                 dr * math.sin(a) + r * math.cos(a) * total_ang,
                 height)
 
-    Q = [pt(k / n) for k in range(n + 1)]
-    D0, Dn = deriv(0.0), deriv(1.0)
+    return _fit_nurbs([pt(k / n) for k in range(n + 1)], deriv(0.0), deriv(1.0))
+
+
+def _dot(a, b):
+    return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+
+
+def _sub(a, b):
+    return (a[0] - b[0], a[1] - b[1], a[2] - b[2])
+
+
+def _scale(a, s):
+    return (a[0] * s, a[1] * s, a[2] * s)
+
+
+def _cross(a, b):
+    return (a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0])
+
+
+def _unit(a):
+    n = math.sqrt(_dot(a, a))
+    return _scale(a, 1.0 / n) if n > 1e-12 else (0.0, 0.0, 0.0)
+
+
+def _rmf(samples, up):
+    """Rotation-minimising frames (Wang et al. double reflection) along sampled
+    (point, tangent) pairs. Returns (point, t, r, b) per sample with r the
+    reference direction, starting sideways from the path within the plane
+    normal to `up`."""
+    pts = [s[0] for s in samples]
+    tans = [_unit(s[1]) for s in samples]
+    r = _unit(_cross(tans[0], up))
+    if _dot(r, r) < 0.5:
+        for axis in ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0)):
+            r = _unit(_cross(tans[0], axis))
+            if _dot(r, r) > 0.5:
+                break
+    frames = []
+    for i, (p, t) in enumerate(zip(pts, tans)):
+        if i:
+            v1 = _sub(p, pts[i - 1])
+            c1 = _dot(v1, v1)
+            if c1 > 1e-18:
+                rL = _sub(r, _scale(v1, 2 * _dot(v1, r) / c1))
+                tL = _sub(tans[i - 1], _scale(v1, 2 * _dot(v1, tans[i - 1]) / c1))
+                v2 = _sub(t, tL)
+                c2 = _dot(v2, v2)
+                r = rL if c2 < 1e-18 else _sub(rL, _scale(v2, 2 * _dot(v2, rL) / c2))
+            r = _unit(_sub(r, _scale(t, _dot(r, t))))
+        frames.append((p, t, r, _cross(t, r)))
+    return frames
+
+
+def path_helix_nurbs(sampler, r0, dr, turns, start_ang, right_hand, up, per_turn=SAMPLES_PER_TURN):
+    """Helix wound around a path. sampler(t) -> (point, tangent) at fraction t
+    of the path's arc length; everything in the sampler's coordinate space."""
+    n = _sample_count(turns, per_turn)
+    d = 0.1 / n   # two extra samples at each end for second-order end tangents
+    ts = [0.0, d, 2 * d] + [k / n for k in range(1, n)] + [1.0 - 2 * d, 1.0 - d, 1.0]
+    total_ang = 2 * math.pi * turns * (1 if right_hand else -1)
+    Q = []
+    for t, (p, tv, r, b) in zip(ts, _rmf([sampler(t) for t in ts], up)):
+        a = start_ang + total_ang * t
+        rad = r0 + dr * t
+        Q.append(tuple(p[c] + rad * (math.cos(a) * r[c] + math.sin(a) * b[c]) for c in range(3)))
+
+    def one_sided(q0, q1, q2, h):   # f'(0) ~ (-3 f0 + 4 f1 - f2) / 2h
+        return tuple((-3 * q0[c] + 4 * q1[c] - q2[c]) / (2 * h) for c in range(3))
+    D0 = one_sided(Q[0], Q[1], Q[2], d)
+    Dn = one_sided(Q[-1], Q[-2], Q[-3], -d)
+    return _fit_nurbs([Q[0]] + Q[3:-3] + [Q[-1]], D0, Dn)
+
+
+def _fit_nurbs(Q, D0, Dn):
+    """Cubic B-spline through the points Q (uniformly parameterised) with end
+    tangents D0, Dn (Piegl & Tiller 9.2.1)."""
+    n = len(Q) - 1
     uk = [k / n for k in range(n + 1)]
     p, m = 3, n + 3
     U = [0.0] * 4 + uk[1:n] + [1.0] * 4
@@ -203,9 +290,12 @@ def resolve(spec):
     elif mode == MODE_HP:
         height, pitch = spec['height'], spec['pitch']
         turns = height / pitch if pitch else 0.0
+    elif mode in PATH_MODES:
+        height = spec.get('_length', 0.0)   # the path's arc length
+        turns = (height / spec['pitch'] if spec['pitch'] else 0.0) if mode == MODE_PP else spec['turns']
     else:  # spiral
         turns, height = spec['turns'], 0.0
-    if mode == MODE_SPIRAL:
+    if mode == MODE_SPIRAL or spec.get('taperBy', 'angle') == 'radius':
         dr = spec['endRadius'] - r0
     else:
         dr = math.tan(spec.get('taper', 0.0)) * height
@@ -214,6 +304,16 @@ def resolve(spec):
 
 def build_curve(spec):
     """NurbsCurve3D in sketch space from a spec dict."""
+    if spec['mode'] in PATH_MODES:
+        if not spec.get('_sampler'):
+            raise HelixError('Pick a path for the helix to follow.')
+        r0, dr, height, turns = resolve(spec)
+        P, U = path_helix_nurbs(spec['_sampler'], r0, dr, turns, spec['startAngle'],
+                                spec['hand'] == 'right', spec['_up'])
+        pts = [adsk.core.Point3D.create(*p) for p in P]
+        for pt in pts:
+            pt.transformBy(spec['_Si'])   # path is sampled in model space
+        return adsk.core.NurbsCurve3D.createNonRational(pts, 3, U, False)
     r0, dr, height, turns = resolve(spec)
     P, U = helix_nurbs(r0, dr, height, turns, spec['startAngle'], spec['hand'] == 'right')
     pts = [adsk.core.Point3D.create(*p) for p in P]
@@ -224,6 +324,46 @@ def build_curve(spec):
         for pt in pts:
             pt.transformBy(M)
     return adsk.core.NurbsCurve3D.createNonRational(pts, 3, U, False)
+
+
+def _path_geometry(ent):
+    sc = adsk.fusion.SketchCurve.cast(ent)
+    if sc:
+        return sc.worldGeometry
+    ed = adsk.fusion.BRepEdge.cast(ent)
+    if ed:
+        return ed.geometry
+    return None
+
+
+def _path_sampler(curve3d):
+    """(sampler, length): sampler(t) gives (point, tangent) at fraction t of
+    the arc length, in the curve's own (model) space."""
+    ev = curve3d.evaluator
+    _, pmin, pmax = ev.getParameterExtents()
+    _, length = ev.getLengthAtParameter(pmin, pmax)
+
+    def sample(t):
+        _, u = ev.getParameterAtLength(pmin, min(max(t, 0.0), 1.0) * length)
+        _, p = ev.getPointAtParameter(u)
+        _, d = ev.getFirstDerivative(u)
+        return (p.x, p.y, p.z), (d.x, d.y, d.z)
+    return sample, length
+
+
+def _attach_path(spec, sketch_xf, path_ent):
+    """For the path modes: hang the sampler, the path length, the model->sketch
+    matrix and the sketch normal (angle reference) on the spec."""
+    if spec['mode'] not in PATH_MODES:
+        return
+    curve = _path_geometry(path_ent) if path_ent is not None and path_ent.isValid else None
+    if curve is None:
+        spec['_sampler'] = None
+        return
+    spec['_sampler'], spec['_length'] = _path_sampler(curve)
+    spec['_Si'] = _model_to_sketch(sketch_xf)
+    _, _, _, z = sketch_xf.getAsCoordinateSystem()
+    spec['_up'] = (z.x, z.y, z.z)
 
 
 # --------------------------------------------------------------------------
@@ -246,8 +386,9 @@ def _triad_to_sketch(sketch, W):
 def _add_inputs(inputs, spec=None, context='create', sketch=None):
     """context: 'create' | 'edit_feature' | 'edit_sketch'; sketch: the sketch an
     in-sketch helix lives in (enables the placement triad)."""
-    global _pending_selections
+    global _pending_selections, _seeded_end_radius
     _pending_selections = []
+    _seeded_end_radius = 'endRadius' in spec   # an existing end radius must not be overwritten
     lu = app.activeProduct.unitsManager.defaultLengthUnits
     spec = spec or {}
     v = lambda k, d: adsk.core.ValueInput.createByReal(spec.get(k, d))
@@ -263,10 +404,13 @@ def _add_inputs(inputs, spec=None, context='create', sketch=None):
         sel.addSelectionFilter('ConstructionPlanes')
         sel.addSelectionFilter('PlanarFaces')
         sel.setSelectionLimits(0, 1)
-    for sid, label, tip in (('center', 'Center Point', 'Optional. The helix axis passes through this point.'),
-                            ('start', 'Start Point', 'Optional. Where the helix starts: sets radius, start angle and axial offset.')):
+    points = ('SketchPoints', 'ConstructionPoints', 'Vertices')
+    for sid, label, tip, filters in (
+            ('path', 'Path', 'Curve or edge the helix winds around. Pitch is measured along it.', ('SketchCurves', 'Edges')),
+            ('center', 'Center Point', 'Optional. The helix axis passes through this point.', points),
+            ('start', 'Start Point', 'Optional. Where the helix starts: sets radius, start angle and axial offset.', points)):
         sel = inputs.addSelectionInput(sid, label, tip)
-        for flt in ('SketchPoints', 'ConstructionPoints', 'Vertices'):
+        for flt in filters:
             sel.addSelectionFilter(flt)
         sel.setSelectionLimits(0, 1)
         ent = spec.get('_deps', {}).get(sid)
@@ -281,6 +425,11 @@ def _add_inputs(inputs, spec=None, context='create', sketch=None):
     inputs.addValueInput('pitch', 'Pitch', lu, v('pitch', 1.0))
     inputs.addValueInput('height', 'Height', lu, v('height', 3.0))
     inputs.addValueInput('turns', 'Revolutions', '', v('turns', 3.0))
+    tb = inputs.addDropDownCommandInput('taperBy', 'Taper', adsk.core.DropDownStyles.TextListDropDownStyle)
+    cur_tb = spec.get('taperBy', 'angle')
+    for label, key in TAPER_BY:
+        tb.listItems.add(label, key == cur_tb)
+    tb.isEnabled = context != 'edit_feature'   # decides which parameter the feature owns
     inputs.addValueInput('taper', 'Taper Angle', 'deg', v('taper', 0.0))
     inputs.addValueInput('startAngle', 'Start Angle', 'deg', v('startAngle', 0.0))
     hd = inputs.addDropDownCommandInput('hand', 'Direction', adsk.core.DropDownStyles.TextListDropDownStyle)
@@ -311,27 +460,47 @@ def _add_inputs(inputs, spec=None, context='create', sketch=None):
 
 def _apply_mode_visibility(inputs):
     mode = adsk.core.DropDownCommandInput.cast(inputs.itemById('mode')).selectedItem.name
+    path_mode = mode in PATH_MODES
     show = {
         MODE_RP: ('pitch', 'turns', 'taper'),
         MODE_RH: ('turns', 'height', 'taper'),
         MODE_HP: ('height', 'pitch', 'taper'),
         MODE_SPIRAL: ('endRadius', 'turns'),
+        MODE_PP: ('pitch', 'taper'),
+        MODE_PR: ('turns', 'taper'),
     }[mode]
+    taper_by = _taper_by(inputs)
+    if 'taper' in show and taper_by == 'radius':
+        show = tuple('endRadius' if k == 'taper' else k for k in show)
     for k in ('endRadius', 'pitch', 'height', 'turns', 'taper'):
         inputs.itemById(k).isVisible = k in show
-    if inputs.itemById('start'):
-        has_start = _effective_point(inputs, 'start') is not None
-        has_center = _effective_point(inputs, 'center') is not None
-        inputs.itemById('radius').isVisible = not has_start
-        inputs.itemById('startAngle').isVisible = not has_start
-        grp = inputs.itemById('placement_grp')
-        if grp:
-            pinned = has_center and has_start   # both points: axis = sketch normal, triad has no say
-            if grp.isVisible == pinned:
-                grp.isVisible = not pinned
-                tri = adsk.core.TriadCommandInput.cast(inputs.itemById('placement'))
-                if not pinned and tri and _triad_last:
-                    tri.transform = _triad_last   # showing the triad again resets it
+    inputs.itemById('taperBy').isVisible = mode != MODE_SPIRAL
+    # The plane only matters as the sketch the curve lives in and the reference
+    # for the zero start angle; along a path both default to the path's sketch.
+    for sid, vis in (('plane', not path_mode), ('path', path_mode), ('center', not path_mode), ('start', not path_mode)):
+        sel = adsk.core.SelectionCommandInput.cast(inputs.itemById(sid))
+        if sel:
+            if not vis and sel.selectionCount:
+                sel.clearSelection()
+            sel.isVisible = vis
+    has_start = not path_mode and _effective_point(inputs, 'start') is not None
+    has_center = not path_mode and _effective_point(inputs, 'center') is not None
+    inputs.itemById('radius').isVisible = not has_start
+    inputs.itemById('startAngle').isVisible = not has_start
+    grp = inputs.itemById('placement_grp')
+    if grp:
+        # Both points pin the helix (axis = sketch normal); a path places it entirely.
+        want = not (path_mode or (has_center and has_start))
+        if grp.isVisible != want:
+            grp.isVisible = want
+            tri = adsk.core.TriadCommandInput.cast(inputs.itemById('placement'))
+            if want and tri and _triad_last:
+                tri.transform = _triad_last   # showing the triad again resets it
+
+
+def _taper_by(inputs):
+    name = adsk.core.DropDownCommandInput.cast(inputs.itemById('taperBy')).selectedItem.name
+    return dict(TAPER_BY)[name]
 
 
 def _read_spec(inputs, sketch=None):
@@ -342,6 +511,7 @@ def _read_spec(inputs, sketch=None):
         'mode': adsk.core.DropDownCommandInput.cast(inputs.itemById('mode')).selectedItem.name,
         'hand': 'right' if adsk.core.DropDownCommandInput.cast(
             inputs.itemById('hand')).selectedItem.name.startswith('Right') else 'left',
+        'taperBy': _taper_by(inputs),
         'expr': {},
     }
     for k in ('radius', 'endRadius', 'pitch', 'height', 'turns', 'taper', 'startAngle'):
@@ -368,6 +538,10 @@ def _read_spec(inputs, sketch=None):
         spec['centerToken'] = center.entityToken if center else None
         spec['startToken'] = start.entityToken if start else None
         _place_in_sketch(spec, sketch, center, start)
+    if sketch is not None:
+        path = _effective_point(inputs, 'path')
+        spec['pathToken'] = path.entityToken if path else None
+        _attach_path(spec, sketch.transform, path)
     return spec
 
 
@@ -386,13 +560,21 @@ def _place_in_sketch(spec, sketch, center_ent, start_ent):
     _place(spec, M, _model_to_sketch(sketch.transform), center_ent, start_ent)
 
 
-def _param_ids(mode):
-    return {
+def _param_ids(mode, taper_by='angle'):
+    ids = {
         MODE_RP: ('radius', 'pitch', 'turns', 'taper', 'startAngle'),
         MODE_RH: ('radius', 'turns', 'height', 'taper', 'startAngle'),
         MODE_HP: ('radius', 'height', 'pitch', 'taper', 'startAngle'),
         MODE_SPIRAL: ('radius', 'endRadius', 'turns', 'startAngle'),
+        MODE_PP: ('radius', 'pitch', 'taper', 'startAngle'),
+        MODE_PR: ('radius', 'turns', 'taper', 'startAngle'),
     }[mode]
+    if taper_by == 'radius':
+        ids = tuple('endRadius' if i == 'taper' else i for i in ids)
+    return ids
+
+
+TAPER_BY = [('By angle', 'angle'), ('By end radius', 'radius')]
 
 
 AXIS_CHOICES = [('XY plane (axis = triad Z)', 'Z'),
@@ -464,6 +646,10 @@ def _place(spec, M, Si, center_ent, start_ent):
     sketch space; Si maps model space to sketch space. A centre point moves
     the local origin onto it; a start point sets radius, start angle and the
     axial offset. Writes spec['xform']; mutates M."""
+    if spec['mode'] in PATH_MODES:   # the path places the helix; nothing else does
+        spec.pop('xform', None)
+        return
+
     def to_sketch(ent):
         p = _point_world(ent)
         p.transformBy(Si)
@@ -512,7 +698,8 @@ def _dep_entity(cf, dep_id):
 def _spec_of_feature(cf):
     spec = {'mode': cf.customNamedValues.value('mode') or MODE_RP,
             'hand': cf.customNamedValues.value('hand') or 'right',
-            '_deps': {k: _dep_entity(cf, k) for k in ('center', 'start')}}
+            'taperBy': cf.customNamedValues.value('taperBy') or 'angle',
+            '_deps': {k: _dep_entity(cf, k) for k in ('center', 'start', 'path')}}
     for i in range(cf.parameters.count):
         p = cf.parameters.item(i)
         spec[p.id] = p.value
@@ -530,6 +717,7 @@ def _rebuild_feature(cf):
     sk = _sketch_of(cf)
     spec = _spec_of_feature(cf)
     _apply_points(_model_to_sketch(sk.transform), spec, spec['_deps']['center'], spec['_deps']['start'])
+    _attach_path(spec, sk.transform, spec['_deps']['path'])
     fs = sk.sketchCurves.sketchFixedSplines.item(0)
     return fs.replaceGeometry(build_curve(spec))
 
@@ -580,7 +768,7 @@ def _spec_of_curve(curve):
     if not a:
         return None
     spec = json.loads(a.value)
-    spec['_deps'] = {k: _entity_by_token(spec.get(k + 'Token')) for k in ('center', 'start')}
+    spec['_deps'] = {k: _entity_by_token(spec.get(k + 'Token')) for k in ('center', 'start', 'path')}
     return spec
 
 
@@ -596,33 +784,31 @@ UNIT_OF = {'radius': 'len', 'endRadius': 'len', 'pitch': 'len', 'height': 'len',
 
 
 def _evaluate_spec(spec, sketch):
-    """Re-evaluate the stored expressions against the current user parameters
-    and the placement against the current centre / start points. Returns True
-    if anything changed (spec is updated in place)."""
+    """Bring a stored in-sketch spec up to date: expressions against the
+    current user parameters, placement against the current centre / start
+    points, and the path's current shape. Mutates spec."""
     um = app.activeProduct.unitsManager
     lu = um.defaultLengthUnits
-    changed = False
     for k, expr in spec.get('expr', {}).items():
         unit = {'len': lu, 'deg': 'deg', '': ''}[UNIT_OF[k]]
         try:
-            v = um.evaluateExpression(expr, unit)
+            spec[k] = um.evaluateExpression(expr, unit)
         except Exception:
-            continue  # a referenced parameter went away; keep the last value
-        if abs(v - spec.get(k, v)) > 1e-9:
-            spec[k] = v
-            changed = True
+            pass  # a referenced parameter went away; keep the last value
     if spec.get('triad'):
-        before = (spec.get('xform'), spec['radius'], spec['startAngle'])
         _place_in_sketch(spec, sketch, _entity_by_token(spec.get('centerToken')),
                          _entity_by_token(spec.get('startToken')))
-        if before != (spec.get('xform'), spec['radius'], spec['startAngle']):
-            changed = True
-    return changed
+    _attach_path(spec, sketch.transform, _entity_by_token(spec.get('pathToken')))
+
+
+def _curve_differs(a, b, tol=1e-7):
+    ca, cb = a.controlPoints, b.controlPoints
+    return len(ca) != len(cb) or any(p.distanceTo(q) > tol for p, q in zip(ca, cb))
 
 
 def _refresh_sketch_helices():
-    """Called after any command finishes: update in-sketch helices whose
-    expressions or driving points now give a different curve."""
+    """Called after any command finishes: rebuild in-sketch helices whose
+    expressions, driving points or path now give a different curve."""
     des = adsk.fusion.Design.cast(app.activeProduct)
     if not des:
         return
@@ -631,13 +817,22 @@ def _refresh_sketch_helices():
         if not curve or not curve.isValid:
             continue
         spec = json.loads(attr.value)
-        if _evaluate_spec(spec, curve.parentSketch):
-            curve.replaceGeometry(build_curve(spec))
-            attr.value = json.dumps(spec)
+        _evaluate_spec(spec, curve.parentSketch)
+        try:
+            new = build_curve(spec)
+        except HelixError:
+            continue   # its path is gone; leave the curve as it is
+        if _curve_differs(curve.geometry, new):
+            curve.replaceGeometry(new)
+            attr.value = json.dumps(_storable(spec))
+
+
+def _storable(spec):
+    return {k: v for k, v in spec.items() if not k.startswith('_')}
 
 
 def _store_spec_on_curve(curve, spec):
-    curve.attributes.add(ATTR_GROUP, 'spec', json.dumps({k: v for k, v in spec.items() if not k.startswith('_')}))
+    curve.attributes.add(ATTR_GROUP, 'spec', json.dumps(_storable(spec)))
 
 
 class ComputeHandler(adsk.fusion.CustomFeatureEventHandler):
@@ -701,11 +896,17 @@ class InputChanged(adsk.core.InputChangedEventHandler):
     def notify(self, args):
         try:
             args = adsk.core.InputChangedEventArgs.cast(args)
-            if _touch_armed and args.input.id in ('center', 'start'):
+            if _touch_armed and args.input.id in ('center', 'start', 'path'):
                 _touched.add(args.input.id)
             if args.input.id == 'center':
                 _triad_follow_center(args.inputs)
-            if args.input.id in ('mode', 'center', 'start'):
+            global _seeded_end_radius
+            if args.input.id == 'taperBy' and _taper_by(args.inputs) == 'radius' and not _seeded_end_radius:
+                # First switch to an end radius in this dialog: start from "no taper".
+                _seeded_end_radius = True
+                er = adsk.core.ValueCommandInput.cast(args.inputs.itemById('endRadius'))
+                er.expression = adsk.core.ValueCommandInput.cast(args.inputs.itemById('radius')).expression
+            if args.input.id in ('mode', 'center', 'start', 'path', 'taperBy'):
                 _apply_mode_visibility(args.inputs)
             _advance_focus(args.inputs, args.input.id)
         except Exception:
@@ -717,22 +918,21 @@ def _picked(inputs, sid):
     return sel.selection(0).entity if sel and sel.selectionCount else None
 
 
-NEXT_PICKER = {'plane': 'center', 'center': 'start', 'start': None}
-
-
 def _advance_focus(inputs, changed_id):
     """Each picker takes one entity, so once it is filled hand selection focus
-    to the next picker. After the last one Fusion is left to its own devices:
-    the API can't give a value box focus, and releasing picker focus just
-    sends it to the canvas."""
-    if changed_id not in NEXT_PICKER:
+    to the next visible picker. After the last one Fusion is left to its own
+    devices: the API can't give a value box focus, and releasing picker focus
+    just sends it to the canvas."""
+    if changed_id not in PICKERS:
         return
     sel = adsk.core.SelectionCommandInput.cast(inputs.itemById(changed_id))
     if not sel or sel.selectionCount == 0:
         return
-    nxt = inputs.itemById(NEXT_PICKER[changed_id]) if NEXT_PICKER[changed_id] else None
-    if nxt and nxt.isVisible:
-        adsk.core.SelectionCommandInput.cast(nxt).hasFocus = True
+    for sid in PICKERS[PICKERS.index(changed_id) + 1:]:
+        nxt = inputs.itemById(sid)
+        if nxt and nxt.isVisible:
+            adsk.core.SelectionCommandInput.cast(nxt).hasFocus = True
+            return
 
 
 def _triad_follow_center(inputs):
@@ -768,21 +968,22 @@ def _wire(cmd, execute_handler, activate=None, destroy=None, preview=None):
 # --------------------------------------------------------------------------
 # Create command
 # --------------------------------------------------------------------------
-def _create_sketch(comp, plane, spec, center_ent=None, start_ent=None):
+def _create_sketch(comp, plane, spec, center_ent=None, start_ent=None, path_ent=None):
     sk = comp.sketches.add(plane)
     sk.name = 'Helix'
     _apply_points(_model_to_sketch(sk.transform), spec, center_ent, start_ent)
+    _attach_path(spec, sk.transform, path_ent)
     sk.sketchCurves.sketchFixedSplines.addByNurbsCurve(build_curve(spec))
     return sk
 
 
-def _create_feature(comp, plane, spec, center_ent=None, start_ent=None):
+def _create_feature(comp, plane, spec, center_ent=None, start_ent=None, path_ent=None):
     lu = app.activeProduct.unitsManager.defaultLengthUnits
     units = {'len': lu, 'deg': 'deg', '': ''}
-    sk = _create_sketch(comp, plane, spec, center_ent, start_ent)
+    sk = _create_sketch(comp, plane, spec, center_ent, start_ent, path_ent)
 
     cfi = comp.features.customFeatures.createInput(_def)
-    for pid in _param_ids(spec['mode']):
+    for pid in _param_ids(spec['mode'], spec.get('taperBy', 'angle')):
         name, ukey = PARAM_META[pid]
         cfi.addCustomParameter(pid, name, adsk.core.ValueInput.createByString(spec['expr'][pid]),
                                units[ukey], True)
@@ -791,20 +992,26 @@ def _create_feature(comp, plane, spec, center_ent=None, start_ent=None):
         cfi.addDependency('center', center_ent)
     if start_ent:
         cfi.addDependency('start', start_ent)
+    if path_ent:
+        cfi.addDependency('path', path_ent)
     cfi.setStartAndEndFeatures(sk, sk)
     cf = comp.features.customFeatures.add(cfi)
     cf.customNamedValues.addOrSetValue('mode', spec['mode'])
     cf.customNamedValues.addOrSetValue('hand', spec['hand'])
+    cf.customNamedValues.addOrSetValue('taperBy', spec.get('taperBy', 'angle'))
     return cf
 
 
 def _feature_placement(inputs, comp):
-    """(plane, centre point, start point) for a feature created outside a sketch."""
-    plane, center_ent, start_ent = _picked(inputs, 'plane'), _picked(inputs, 'center'), _picked(inputs, 'start')
+    """(plane, centre, start, path) for a feature created outside a sketch.
+    No plane picked: the centre point's or path's sketch plane, else XY."""
+    plane, center_ent, start_ent, path_ent = (_picked(inputs, s) for s in ('plane', 'center', 'start', 'path'))
     if plane is None:
         sp = adsk.fusion.SketchPoint.cast(center_ent) if center_ent else None
-        plane = sp.parentSketch.referencePlane if sp else comp.xYConstructionPlane
-    return plane, center_ent, start_ent
+        sc = adsk.fusion.SketchCurve.cast(path_ent) if path_ent else None
+        owner = sp or sc
+        plane = owner.parentSketch.referencePlane if owner else comp.xYConstructionPlane
+    return plane, center_ent, start_ent, path_ent
 
 
 class CreateExecute(adsk.core.CommandEventHandler):
@@ -820,13 +1027,15 @@ class CreateExecute(adsk.core.CommandEventHandler):
                     curve = sk.sketchCurves.sketchFixedSplines.addByNurbsCurve(build_curve(spec))
                     _store_spec_on_curve(curve, spec)
                     return
-                # A feature can't carry the triad; it is placed by the plane and points only.
+                # A feature can't carry the triad; it is placed by the plane, points and path only.
                 _create_feature(sk.parentComponent, sk.referencePlane, spec,
-                                _picked(inputs, 'center'), _picked(inputs, 'start'))
+                                _picked(inputs, 'center'), _picked(inputs, 'start'), _picked(inputs, 'path'))
                 return
             comp = des.activeComponent
-            plane, center_ent, start_ent = _feature_placement(inputs, comp)
-            _create_feature(comp, plane, spec, center_ent, start_ent)
+            plane, center_ent, start_ent, path_ent = _feature_placement(inputs, comp)
+            _create_feature(comp, plane, spec, center_ent, start_ent, path_ent)
+        except HelixError as e:
+            ui.messageBox(str(e), 'Helix3D')
         except Exception:
             ui.messageBox('Helix3D create failed:\n' + traceback.format_exc())
 
@@ -847,8 +1056,10 @@ class CreatePreview(adsk.core.CommandEventHandler):
                     args.isValidResult = True
                 return
             comp = adsk.fusion.Design.cast(app.activeProduct).activeComponent
-            plane, center_ent, start_ent = _feature_placement(inputs, comp)
-            _create_sketch(comp, plane, spec, center_ent, start_ent)
+            plane, center_ent, start_ent, path_ent = _feature_placement(inputs, comp)
+            _create_sketch(comp, plane, spec, center_ent, start_ent, path_ent)
+        except HelixError:
+            pass   # nothing to preview yet (no path picked)
         except Exception:
             _log('Helix3D preview failed:\n' + traceback.format_exc())
 
@@ -880,16 +1091,14 @@ class CreateCreated(adsk.core.CommandCreatedEventHandler):
 # --------------------------------------------------------------------------
 # Edit feature command (Edit Feature on the timeline node)
 # --------------------------------------------------------------------------
-class HelixError(Exception):
-    """A message for the user, not a traceback."""
-
-
 def _describe(ent):
     if ent is None:
         return 'none'
-    p = _point_world(ent) if ent.isValid else None
-    return '%s%s' % (ent.objectType.split('::')[-1],
-                     ' at (%.3f, %.3f, %.3f)' % (p.x, p.y, p.z) if p else ' (invalid)')
+    kind = ent.objectType.split('::')[-1]
+    if not ent.isValid:
+        return kind + ' (invalid)'
+    p = _point_world(ent)
+    return kind + (' at (%.3f, %.3f, %.3f)' % (p.x, p.y, p.z) if p else '')
 
 
 class EditExecute(adsk.core.CommandEventHandler):
@@ -900,7 +1109,7 @@ class EditExecute(adsk.core.CommandEventHandler):
             cf = _editing
             # Grab the picks before the timeline moves; the inputs may not hold
             # them once their geometry is rolled away.
-            picks = {sid: _effective_point(inputs, sid) for sid in ('center', 'start')}
+            picks = {sid: _effective_point(inputs, sid) for sid in ('center', 'start', 'path')}
             _log('Helix3D edit: picks ' + ', '.join('%s=%s' % (k, _describe(v)) for k, v in picks.items())
                  + '; touched=%s' % sorted(_touched))
             # Dependencies can only change while the marker sits just before the
@@ -910,7 +1119,7 @@ class EditExecute(adsk.core.CommandEventHandler):
             if not _roll_back_for_edit(cf):
                 _log('Helix3D edit: marker %d, feature index %d after roll back'
                         % (tl.markerPosition, cf.timelineObject.index))
-            for sid, label in (('center', 'Center Point'), ('start', 'Start Point')):
+            for sid, label in (('center', 'Center Point'), ('start', 'Start Point'), ('path', 'Path')):
                 new_ent = picks[sid]
                 dep = cf.dependencies.itemById(sid)
                 if new_ent is None:
@@ -959,13 +1168,17 @@ class EditPreview(adsk.core.CommandEventHandler):
             spec = _read_spec(inputs)
             center, start = _effective_point(inputs, 'center'), _effective_point(inputs, 'start')
             _apply_points(_model_to_sketch(_editing_xf), spec, center, start)
+            _attach_path(spec, _editing_xf, _effective_point(inputs, 'path'))
             _log('Helix3D edit preview: picker center=%s start=%s; using center=%s start=%s radius=%.4f'
                  % (_describe(_picked(inputs, 'center')), _describe(_picked(inputs, 'start')),
                     _describe(center), _describe(start), spec['radius']))
+            try:
+                curve = build_curve(spec)
+            except HelixError:
+                return
             sk = _sketch_of(_editing)
             if sk:
                 sk.isVisible = False
-            curve = build_curve(spec)
             curve.transformBy(_editing_xf)
             _draw_preview(_editing.parentComponent, curve)
         except Exception:
@@ -1008,10 +1221,10 @@ class EditPreSelect(adsk.core.SelectionEventHandler):
     def notify(self, args):
         try:
             args = adsk.core.SelectionEventArgs.cast(args)
-            if args.activeInput.id not in ('center', 'start'):
+            if args.activeInput.id not in ('center', 'start', 'path'):
                 return
             ent = args.selection.entity
-            sp = adsk.fusion.SketchPoint.cast(ent)
+            sp = adsk.fusion.SketchPoint.cast(ent) or adsk.fusion.SketchCurve.cast(ent)
             cp = adsk.fusion.ConstructionPoint.cast(ent)
             tlo = sp.parentSketch.timelineObject if sp else (cp.timelineObject if cp else None)
             if tlo and tlo.index >= _editing.timelineObject.index:
@@ -1069,6 +1282,8 @@ class SketchEditExecute(adsk.core.CommandEventHandler):
             spec = _read_spec(inputs, _editing_curve.parentSketch)
             _editing_curve.replaceGeometry(build_curve(spec))
             _store_spec_on_curve(_editing_curve, spec)
+        except HelixError as e:
+            ui.messageBox(str(e), 'Helix3D')
         except Exception:
             ui.messageBox('Helix3D sketch edit failed:\n' + traceback.format_exc())
 
@@ -1081,6 +1296,8 @@ class SketchEditPreview(adsk.core.CommandEventHandler):
             _editing_curve.replaceGeometry(build_curve(spec))
             _store_spec_on_curve(_editing_curve, spec)
             args.isValidResult = True   # preview is the final result; execute is skipped
+        except HelixError:
+            pass
         except Exception:
             _log('Helix3D sketch edit preview failed:\n' + traceback.format_exc())
 

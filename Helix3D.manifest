@@ -6,7 +6,7 @@
     "description": {
         "": "Parametric 3D helix and spiral sketch curves. Source and releases: https://github.com/RonnyM82/AutodeskFusionHelix3D"
     },
-    "version": "0.6.14",
+    "version": "0.7.3",
     "runOnStartup": true,
     "supportedOS": "windows|mac",
     "editEnabled": true
