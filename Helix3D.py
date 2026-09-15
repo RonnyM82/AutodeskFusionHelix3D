@@ -839,6 +839,18 @@ def _find(inputs, cid, depth=0):
     return None
 
 
+def _tip(inputs, cid, tip, description=None):
+    """Set the hover text on an input. Fusion shows `tooltip` straight away and
+    `tooltipDescription` underneath once the pointer rests there, so the first
+    is the label and the second is the explanation."""
+    inp = _find(inputs, cid)
+    if not inp:
+        return
+    inp.tooltip = tip
+    if description:
+        inp.tooltipDescription = description
+
+
 def _cell(inputs, cid):
     """A station table cell, found by where it sits in the table rather than by
     name: pitch<k> and radius<k> are on row k, turns<j> (the gap after station
@@ -871,7 +883,10 @@ def _add_var_inputs(inputs, spec=None, context='create', sketch=None):
 
     pos = inputs.addGroupCommandInput('position_grp', 'Position (optional)')
     pos.isExpanded = True
-    pos.tooltip = 'Where the helix sits. Pick nothing and it starts at the origin of the sketch plane.'
+    pos.tooltip = 'Where the helix sits in the model'
+    pos.tooltipDescription = (
+        'All of these are optional. Leave them alone and the helix is built on the XY '
+        'plane with its axis through the origin.')
     _add_pickers(pos.children, spec, context, with_path=False,
                  start_tip='Optional. Where the helix starts: sets the start angle and the '
                            'height it starts at. The radii come from the table.')
@@ -879,24 +894,35 @@ def _add_var_inputs(inputs, spec=None, context='create', sketch=None):
 
     grp = inputs.addGroupCommandInput('stations_grp', 'Stations')
     grp.isExpanded = True
-    grp.tooltip = ('Station 1 is where the helix starts. Each row after it says how many '
-                   'turns on from the row above it sits, and the pitch and radius there. '
-                   'Click into a row and a cross marks its station on the preview, the run '
-                   'its turns value measures lights up, and a note says what that row is '
-                   'doing to the helix.')
+    grp.tooltip = 'Where along the helix you set the pitch and radius'
+    grp.tooltipDescription = (
+        'A station is one place along the helix. You give it a pitch and a radius, and '
+        'between two stations both values blend from one to the other. That is what makes '
+        'the pitch variable.<br><br>Click into any row and the preview shows you where that '
+        'station is, lights up the run of helix that row controls, and writes out what it '
+        'is doing.')
     ch = grp.children
     cnt = ch.addIntegerSpinnerCommandInput('stations', 'Stations', 2, MAX_STATIONS, 1, n)
     cnt.isEnabled = context != 'edit_feature'   # a feature's parameters are fixed
-    cnt.tooltip = ('How many points along the helix you set a pitch and a radius at. '
-                   'Fusion fixes which parameters a custom feature owns when it is '
-                   'created, so this is greyed out when you edit one.')
+    cnt.tooltip = 'How many stations the helix has'
+    cnt.tooltipDescription = (
+        'Two gives a plain helix. Add more and the pitch can change several times along '
+        'the length, which is what a progressive spring or a timing screw needs.<br><br>'
+        'This is greyed out when you edit a finished feature. Fusion decides which '
+        'parameters a feature owns at the moment it is created and will not let them '
+        'change afterwards, so a different number of stations means a new helix.')
     bl = ch.addDropDownCommandInput('blend', 'Blend', adsk.core.DropDownStyles.TextListDropDownStyle)
     cur_blend = spec.get('blend', 'smooth')
     for label, key in BLENDS:
         bl.listItems.add(label, key == cur_blend)
-    bl.tooltip = ('How the pitch gets from one station to the next. Smooth keeps the '
-                  'curvature continuous, so a sweep along it has no crease at a station. '
-                  'Linear ramps in a straight line, which is what SOLIDWORKS does.')
+    bl.tooltip = 'How the pitch changes between one station and the next'
+    bl.tooltipDescription = (
+        'Smooth eases from one pitch to the other, so a body swept along the curve has no '
+        'crease where the pitch changes. This is the one to use for a spring.<br><br>'
+        'Linear goes straight from one pitch to the other, which is what SOLIDWORKS does. '
+        'It leaves a slight kink at each station.<br><br>The choice changes the height, '
+        'because the height is the area under the pitch and the two shapes cover '
+        'different areas.')
 
     table = ch.addTableCommandInput('table', 'Stations', 4, '1:4:3:3')
     table.minimumVisibleRows = 3
@@ -920,11 +946,10 @@ def _add_var_inputs(inputs, spec=None, context='create', sketch=None):
 
     ends = inputs.addGroupCommandInput('ends_grp', 'Ends')
     ends.isExpanded = True
-    ends.tooltip = ('Natural starts or finishes at the station as it stands. Flat adds a run '
-                    'at the pitch you give, for the flat turns, then eases into the station '
-                    'over the transition turns. Zero pitch is a true flat, which is what a '
-                    'timing screw dwell wants. A closed spring end wants the wire diameter, '
-                    'or the sweep passes through itself.')
+    ends.tooltip = 'Extra coils on the ends of the helix'
+    ends.tooltipDescription = (
+        'The same idea as the coil ends in Inventor. Use this for the closed ends of a '
+        'spring, or for a dwell on a timing screw.')
     ec = ends.children
     for side, label in (('start', 'Start'), ('end', 'End')):
         dd = ec.addDropDownCommandInput(side + 'Type', label, adsk.core.DropDownStyles.TextListDropDownStyle)
@@ -945,14 +970,78 @@ def _add_var_inputs(inputs, spec=None, context='create', sketch=None):
     hd.listItems.add('Right hand', rh)
     hd.listItems.add('Left hand', not rh)
     fl = wc.addBoolValueInput('flip', 'Flip direction', True, '', bool(spec.get('flip')))
-    fl.tooltip = ('Run the helix down the axis instead of up. The winding stays right or '
-                  'left handed either way, and the stations stay in the order you typed.')
+    fl.tooltip = 'Run the helix down the axis instead of up'
+    fl.tooltipDescription = (
+        'Everything else stays as it is. Station 1 is still the start, the order of the '
+        'table does not change, and a right hand helix stays right hand. It simply builds '
+        'downwards from where it starts.')
 
     if context == 'create' and _in_sketch():
-        inputs.addBoolValueInput('asFeature', 'Finish sketch and create parametric feature', True, '', False)
+        af = inputs.addBoolValueInput('asFeature', 'Finish sketch and create parametric feature',
+                                      True, '', False)
+        af.tooltip = 'Close this sketch and wrap the helix as a feature'
+        af.tooltipDescription = (
+            'Off, the curve goes into the sketch you are editing. On, the sketch is closed '
+            'and the helix becomes a feature in the timeline, which puts its values in the '
+            'Parameters dialog where you can drive them from other parameters.')
 
+    _add_var_tooltips(inputs)
     _apply_var_visibility(inputs)
     _update_var_readout(inputs)
+
+
+def _add_var_tooltips(inputs):
+    """Hover text for everything in the variable pitch dialog. The pickers and
+    the placement triad are shared with the other command, so their wording is
+    set here rather than where they are built."""
+    _tip(inputs, 'plane', 'The flat plane the helix is built on',
+         'The axis of the helix points straight out of this plane. Leave it empty and '
+         'Fusion uses the XY plane, or the plane of the centre point if you pick one.')
+    _tip(inputs, 'center', 'A point for the axis to pass through',
+         'Optional. Use it to put the helix somewhere other than the origin.')
+    _tip(inputs, 'start', 'A point for the helix to begin at',
+         'Optional. It sets the angle the helix starts at and the height it starts from. '
+         'The radius still comes from the table, because a single point cannot set a '
+         'different radius at every station.')
+    _tip(inputs, 'placement_grp', 'Position and direction when no points are picked',
+         'Drag the arrows to move the helix and the arcs to turn it.')
+    _tip(inputs, 'axis', 'Which way the helix axis points',
+         'The coils lie in the plane you choose here and the helix winds along the axis '
+         'at right angles to it.')
+    _tip(inputs, 'placement', 'Drag to move and turn the helix',
+         'The straight arrows slide it along an axis and the arcs spin it. It only shows '
+         'when the helix is not already pinned by a centre point and a start point.')
+    _tip(inputs, 'table', 'One row for each station, in order along the helix',
+         'Row 1 is where the helix starts, which is why its turns cell reads start rather '
+         'than a number.')
+    _tip(inputs, 'readout', 'The height and the total turns, worked out from the table',
+         'Height is the area under the pitch, not the pitch multiplied by the turns. Where '
+         'the pitch is changing, a run rises by the average of the two pitches, not by '
+         'either one of them.')
+    for side, label, into in (('start', 'Start', 'into'), ('end', 'End', 'out of')):
+        _tip(inputs, side + 'Type', 'How the %s of the helix is finished' % label.lower(),
+             'Natural begins right at the station, with nothing added.<br><br>Flat adds a '
+             'run of coil at a pitch you choose, then eases %s the station over the '
+             'transition turns.' % into)
+        _tip(inputs, side + 'Pitch', 'How far the flat run climbs in one turn',
+             'Set it to zero for a true flat, which is what a dwell on a timing screw '
+             'needs. For a closed spring end use the wire diameter, or the coils will '
+             'pass through each other when you sweep it.')
+        _tip(inputs, side + 'Flat', 'How many turns the flat run goes on for',
+             'On a spring this is the dead coil that sits against the seat. On a timing '
+             'screw it is how long the container is held still for.')
+        _tip(inputs, side + 'Blend', 'How many turns it takes to ease %s the station' % into,
+             'Spread over more turns it changes more gently. Too short and the coil has to '
+             'bend sharply to catch up.')
+    _tip(inputs, 'startAngle', 'Where around the circle the helix begins',
+         'Zero starts it on the X axis of the plane. It is hidden when you pick a start '
+         'point, because the point decides the angle instead.')
+    _tip(inputs, 'hand', 'Which way the helix winds as it climbs',
+         'Right hand is the usual one, the same as an ordinary screw thread. Left hand '
+         'winds the other way.')
+    _tip(inputs, 'winding_grp', 'Which way the helix turns and where it starts',
+         'None of this changes the pitch or the height, only the direction it winds and '
+         'the point on the circle it begins from.')
 
 
 def _add_station_row(table, k, turns, pitch, radius, lu):
@@ -961,11 +1050,28 @@ def _add_station_row(table, k, turns, pitch, radius, lu):
     tc = table.commandInputs
     table.addCommandInput(tc.addTextBoxCommandInput('s%d' % k, '', '<b>%d</b>' % k, 1, True), k, 0)
     if k == 1:
-        table.addCommandInput(tc.addTextBoxCommandInput('t_start', '', 'start', 1, True), k, 1)
+        cell = tc.addTextBoxCommandInput('t_start', '', 'start', 1, True)
+        cell.tooltip = 'This row is where the helix starts'
+        cell.tooltipDescription = ('There is no run before it, so there is nothing to '
+                                   'measure in turns here.')
     else:
-        table.addCommandInput(tc.addValueInput('turns%d' % (k - 1), 'Turns', '', turns), k, 1)
-    table.addCommandInput(tc.addValueInput('pitch%d' % k, 'Pitch', lu, pitch), k, 2)
-    table.addCommandInput(tc.addValueInput('radius%d' % k, 'Radius', lu, radius), k, 3)
+        cell = tc.addValueInput('turns%d' % (k - 1), 'Turns', '', turns)
+        cell.tooltip = 'Turns from station %d to station %d' % (k - 1, k)
+        cell.tooltipDescription = ('How far round the helix goes between those two '
+                                   'stations. The pitch and radius blend across it.')
+    table.addCommandInput(cell, k, 1)
+    p = tc.addValueInput('pitch%d' % k, 'Pitch', lu, pitch)
+    p.tooltip = 'How far the helix climbs in one turn, at station %d' % k
+    p.tooltipDescription = (
+        'This is a rate, measured at this one point, not a distance the helix travels. '
+        'Where the pitch is changing between two stations, the run rises by the average '
+        'of the two, so it usually rises less than the larger pitch.')
+    table.addCommandInput(p, k, 2)
+    r = tc.addValueInput('radius%d' % k, 'Radius', lu, radius)
+    r.tooltip = 'Distance from the axis at station %d' % k
+    r.tooltipDescription = ('Give two stations different radii and the helix tapers '
+                            'between them, like a conical spring.')
+    table.addCommandInput(r, k, 3)
 
 
 def _size_var_dialog(cmd):
