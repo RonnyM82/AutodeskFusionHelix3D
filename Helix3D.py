@@ -881,9 +881,8 @@ def _add_var_inputs(inputs, spec=None, context='create', sketch=None):
     grp.isExpanded = True
     grp.tooltip = ('Station 1 is where the helix starts. Each row after it says how many '
                    'turns on from the row above it sits, and the pitch and radius there. '
-                   'Click into a row and the stretch of helix nearest that station lights '
-                   'up on the preview; type in a turns cell and it lights the run that '
-                   'number measures.')
+                   'Click into a row and a cross marks its station on the preview, with '
+                   'the run its turns value measures lit up behind it.')
     ch = grp.children
     cnt = ch.addIntegerSpinnerCommandInput('stations', 'Stations', 2, MAX_STATIONS, 1, n)
     cnt.isEnabled = context != 'edit_feature'   # a feature's parameters are fixed
@@ -1002,41 +1001,64 @@ def _rebuild_station_table(inputs):
 
 
 def _var_focus_range(spec):
-    """(from, to) in turns for the part of the helix the dialog is on, or None.
+    """(from, to) in turns for the run the dialog is on: the stretch from the
+    station above down to this row's own station, which is exactly what the
+    row's turns value measures.
 
-    A row owns the stretch of curve nearest its own station: half way back to
-    the station above, half way on to the one below, and out to the end of the
-    curve at the two ends. The rows tile the whole helix between them, so the
-    first and last light up about as much as each other. Lighting the run above
-    each station instead left the first row with nothing to show, since it has
-    no station above it.
-
-    A turns cell is different: it lights the run it actually measures, from the
-    station above down to its own."""
+    Clicking a cell tells us the row and nothing else, so every cell in a row
+    has to mean the same thing, and the turns value is the only thing in a row
+    that describes a run. Row 1 has nothing above it, which is why its turns
+    cell says start: it gets a marker and no run."""
     if not _var_focus or spec.get('mode') != MODE_VAR:
         return None
     xs, _, _ = _station_axes(_expanded_stations(spec))
     o = 2 if spec.get('startType') == 'flat' else 0      # user station k sits at xs[k-1+o]
     n = len(spec['stations'])
     at = lambda k: xs[k - 1 + o]
-    mid = lambda a, b: (at(a) + at(b)) / 2.0
     kind = _var_focus[0]
     if kind == 'row':
         k = _var_focus[1]
-        if 1 <= k <= n:
-            return (0.0 if k == 1 else mid(k - 1, k),
-                    xs[-1] if k == n else mid(k, k + 1))
-    elif kind == 'span':                                 # a turns cell
-        j = _var_focus[1]
-        if 1 <= j < n:
-            return at(j), at(j + 1)
+        if k == 1:
+            return (0.0, at(1)) if o else None      # the flat start, if there is one
+        if 2 <= k <= n:
+            return at(k - 1), at(k)
     elif kind == 'start':
-        return (0.0, at(1)) if o else (0.0, min(0.35, xs[-1]))
+        return (0.0, at(1)) if o else None
     elif kind == 'end':
-        if spec.get('endType') == 'flat':
-            return at(n), xs[-1]
-        return max(0.0, xs[-1] - 0.35), xs[-1]
+        return (at(n), xs[-1]) if spec.get('endType') == 'flat' else None
     return None
+
+
+def _var_focus_station(spec):
+    """Turns at the station the dialog is on, so it can be marked."""
+    if not _var_focus or spec.get('mode') != MODE_VAR:
+        return None
+    xs, _, _ = _station_axes(_expanded_stations(spec))
+    o = 2 if spec.get('startType') == 'flat' else 0
+    n = len(spec['stations'])
+    kind = _var_focus[0]
+    if kind == 'row' and 1 <= _var_focus[1] <= n:
+        return xs[_var_focus[1] - 1 + o]
+    if kind == 'start':
+        return xs[o]
+    if kind == 'end':
+        return xs[-1]
+    return None
+
+
+def _helix_point(spec, u):
+    """The point at u turns along the helix, in sketch space. A clamped spline
+    starts and ends on its outer control points, so a hair of curve either side
+    of u gives the point exactly."""
+    sts = _expanded_stations(spec)
+    total = _station_axes(sts)[0][-1]
+    eps = max(total, 1e-6) * 1e-3
+    tail = u >= total - eps
+    lo = max(total - eps, 0.0) if tail else min(max(u, 0.0), max(total - eps, 0.0))
+    P, _ = var_helix_nurbs(sts, spec['startAngle'], spec['hand'] == 'right',
+                           spec.get('blend', 'smooth') == 'smooth', bool(spec.get('flip')),
+                           PREVIEW_SAMPLES_PER_TURN, (lo, lo + eps))
+    return adsk.core.Point3D.create(*(P[-1] if tail else P[0]))
 
 
 def _build_highlight(spec):
@@ -1048,6 +1070,107 @@ def _build_highlight(spec):
                            spec.get('blend', 'smooth') == 'smooth', bool(spec.get('flip')),
                            PREVIEW_SAMPLES_PER_TURN, rng)
     return _curve_from(P, U, spec.get('xform'))
+
+
+def _build_marker(spec):
+    """(point in sketch space, arm length) for a cross on the row's station."""
+    u = _var_focus_station(spec)
+    if u is None:
+        return None
+    p = _helix_point(spec, u)
+    xf = spec.get('xform')
+    if xf:
+        M = adsk.core.Matrix3D.create()
+        M.setWithArray(xf)
+        p.transformBy(M)
+    r = max([st.get('radius', 0.0) for st in spec['stations']] or [1.0])
+    return p, max(r * 0.16, 0.05)
+
+
+ORANGE = (255, 140, 0)
+
+
+def _show_highlight(spec, comp, xf):
+    """Overlay on the part of the helix the dialog is on: the run the row's
+    turns value measures, and a cross on the row's own station. Lives in the
+    preview transaction with everything else, so it goes when the dialog does."""
+    try:
+        curve = _build_highlight(spec)
+        mark = _build_marker(spec)
+    except HelixError:
+        return
+    if curve is None and mark is None:
+        return
+    g = comp.customGraphicsGroups.add()
+    paint = adsk.fusion.CustomGraphicsSolidColorEffect.create(adsk.core.Color.create(*(ORANGE + (255,))))
+
+    def draw(geom, weight):
+        e = g.addCurve(geom)
+        e.weight = weight
+        e.color = paint
+        try:
+            e.depthPriority = 1     # over the curve it sits on
+        except Exception:
+            pass
+
+    if curve is not None:
+        curve.transformBy(xf)
+        draw(curve, 5)
+    if mark is not None:
+        p, size = mark
+        p.transformBy(xf)
+        for dx, dy, dz in ((size, 0, 0), (0, size, 0), (0, 0, size)):
+            draw(adsk.core.Line3D.create(
+                adsk.core.Point3D.create(p.x - dx, p.y - dy, p.z - dz),
+                adsk.core.Point3D.create(p.x + dx, p.y + dy, p.z + dz)), 3)
+
+
+class VarPoll(adsk.core.CustomEventHandler):
+    """Fusion fires nothing when a table row is clicked, only when a value
+    changes. A thread ticks this event while the dialog is open; here, on the
+    main thread, the selected row is compared with the last one seen and the
+    preview is redrawn when it has moved."""
+    def notify(self, args):
+        global _var_last_row, _var_focus
+        try:
+            cmd = _var_cmd
+            if cmd is None or not cmd.isValid:
+                return
+            table = adsk.core.TableCommandInput.cast(_find(cmd.commandInputs, 'table'))
+            if not table:
+                return
+            row = table.selectedRow
+            if row == _var_last_row:
+                return
+            _var_last_row = row
+            if row >= 1:
+                _var_focus = ('row', row)
+                cmd.doExecutePreview()
+        except Exception:
+            _log('Helix3D row watch failed:\n' + traceback.format_exc())
+
+
+def _start_var_poll(cmd):
+    global _var_cmd, _var_poll_stop, _var_last_row
+    _stop_var_poll()
+    _var_cmd, _var_last_row = cmd, -2
+    stop = threading.Event()
+    _var_poll_stop = stop
+
+    def tick():
+        while not stop.wait(0.15):
+            try:
+                app.fireCustomEvent(VAR_POLL_EVT)
+            except Exception:
+                break
+    threading.Thread(target=tick, daemon=True).start()
+
+
+def _stop_var_poll():
+    global _var_cmd, _var_poll_stop
+    if _var_poll_stop is not None:
+        _var_poll_stop.set()
+    _var_cmd, _var_poll_stop = None, None
 
 
 def _selected_row(inputs):
@@ -1709,8 +1832,8 @@ class InputChanged(adsk.core.InputChangedEventHandler):
                 elif base != cid and base in ('pitch', 'radius'):
                     _var_focus = ('row', int(cid[len(base):]))
                     _var_last_row = _selected_row(inputs)
-                elif base != cid and base == 'turns':   # turns<j> runs station j to j+1
-                    _var_focus = ('span', int(cid[len(base):]))
+                elif base != cid and base == 'turns':   # turns<j> sits on row j+1
+                    _var_focus = ('row', int(cid[len(base):]) + 1)
                     _var_last_row = _selected_row(inputs)
                 elif cid.startswith('start') and cid != 'startAngle':
                     _var_focus = ('start',)
