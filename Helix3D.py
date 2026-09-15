@@ -23,6 +23,7 @@ import adsk.fusion
 import json
 import math
 import os
+import threading
 import traceback
 
 app = adsk.core.Application.get()
@@ -51,6 +52,8 @@ PATH_MODES = (MODE_PP, MODE_PR)
 # spec value rather than another item in the Mode dropdown.
 MODE_VAR = 'Variable Pitch'
 BLENDS = [('Smooth', 'smooth'), ('Linear', 'linear')]
+END_TYPES = [('Natural', 'natural'), ('Flat', 'flat')]   # Inventor's words for coil ends
+END_FIELDS = ('Pitch', 'Flat', 'Blend')                  # startPitch, startFlat, startBlend ...
 MAX_STATIONS = 10
 PICKERS = ('plane', 'path', 'center', 'start')   # dialog order; selection focus walks along it
 
@@ -70,6 +73,7 @@ _editing_deps = {}      # {'center': entity, 'start': entity} as stored when the
 _touched = set()        # point inputs the user changed (or cleared) in the edit dialog
 _touch_armed = False    # ignore inputChanged until the dialog has finished setting itself up
 TOUCH_EVT = 'scottHelix3DDeferredTouch'
+VAR_POLL_EVT = 'scottHelix3DVarPoll'
 _touch_pending = set()  # entity tokens of features rebuilt by compute since the last touch
 _touching = False
 _editing_curve = None   # SketchFixedSpline in the sketch edit dialog
@@ -80,7 +84,10 @@ LOG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'Helix3D.log
 SETTINGS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'Helix3D.settings.json')
 _triad_last = None      # last meaningful triad transform (world); restored when the triad is re-shown
 _seeded_end_radius = False  # end radius pre-filled from the radius once per dialog
-_var_focus = None       # ('station', k) or ('span', k): the part of the helix the dialog is on
+_var_focus = None       # ('row', k), ('start',) or ('end',): the part of the helix the dialog is on
+_var_cmd = None         # the open variable pitch Command, watched for row clicks
+_var_last_row = -2      # table.selectedRow as last seen by the watcher
+_var_poll_stop = None   # threading.Event that ends the watcher
 
 
 def _load_settings():
@@ -531,7 +538,7 @@ def build_curve(spec, per_turn=SAMPLES_PER_TURN):
             pt.transformBy(spec['_Si'])   # path is sampled in model space
         return adsk.core.NurbsCurve3D.createNonRational(pts, 3, U, False)
     if spec['mode'] == MODE_VAR:
-        P, U = var_helix_nurbs(spec['stations'], spec['startAngle'], spec['hand'] == 'right',
+        P, U = var_helix_nurbs(_expanded_stations(spec), spec['startAngle'], spec['hand'] == 'right',
                                spec.get('blend', 'smooth') == 'smooth', flip, per_turn)
         return _curve_from(P, U, spec.get('xform'))
     r0, dr, height, turns = resolve(spec)
@@ -751,10 +758,10 @@ def _apply_mode_visibility(inputs):
 
 
 def _apply_placement_visibility(inputs, want):
-    grp = inputs.itemById('placement_grp')
+    grp = _find(inputs, 'placement_grp')
     if grp and grp.isVisible != want:
         grp.isVisible = want
-        tri = adsk.core.TriadCommandInput.cast(inputs.itemById('placement'))
+        tri = adsk.core.TriadCommandInput.cast(_find(inputs, 'placement'))
         if want and tri and _triad_last:
             tri.transform = _triad_last   # showing the triad again resets it
 
@@ -786,17 +793,17 @@ def _read_spec(inputs, sketch=None):
 def _read_placement(spec, inputs, sketch):
     """Triad, driving points and path, onto the spec. Shared by both dialogs;
     sketch is None for a feature, whose placement the caller applies instead."""
-    tri = inputs.itemById('placement')
+    tri = _find(inputs, 'placement')
     if tri and sketch is not None:
         global _triad_last
         tri = adsk.core.TriadCommandInput.cast(tri)
         axis = None
         for label, key in AXIS_CHOICES:
-            if adsk.core.DropDownCommandInput.cast(inputs.itemById('axis')).selectedItem.name == label:
+            if adsk.core.DropDownCommandInput.cast(_find(inputs, 'axis')).selectedItem.name == label:
                 axis = key
         # positionTransform reports identity on current builds; transform is fine as scaling is hidden.
         # A hidden triad has been reset, so keep using the last one we saw.
-        if inputs.itemById('placement_grp').isVisible:
+        if _find(inputs, 'placement_grp').isVisible:
             T = tri.transform.copy()
             _triad_last = T
         else:
@@ -816,14 +823,38 @@ def _read_placement(spec, inputs, sketch):
 # --------------------------------------------------------------------------
 # Variable pitch dialog
 # --------------------------------------------------------------------------
+def _find(inputs, cid, depth=0):
+    """An input by id, looking inside groups as well; itemById on the top
+    level collection does not see into them. Tables are not descended: their
+    input collection leads back to the top and the walk never ends."""
+    hit = inputs.itemById(cid)
+    if hit or depth > 4:
+        return hit
+    for i in range(inputs.count):
+        g = adsk.core.GroupCommandInput.cast(inputs.item(i))
+        if g:
+            hit = _find(g.children, cid, depth + 1)
+            if hit:
+                return hit
+    return None
+
+
 def _cell(inputs, cid):
-    """A station table cell. They live on the table, not the top level."""
-    table = adsk.core.TableCommandInput.cast(inputs.itemById('table'))
-    return table.commandInputs.itemById(cid) if table else None
+    """A station table cell, found by where it sits in the table rather than by
+    name: pitch<k> and radius<k> are on row k, turns<j> (the gap after station
+    j) on row j+1. Looking a cell up by id through the table's own collection
+    does not work once the table is inside a group."""
+    table = adsk.core.TableCommandInput.cast(_find(inputs, 'table'))
+    if not table:
+        return None
+    base = cid.rstrip('0123456789')
+    k = int(cid[len(base):])
+    row, col = {'turns': (k + 1, 1), 'pitch': (k, 2), 'radius': (k, 3)}[base]
+    return table.getInputAtPosition(row, col)
 
 
 def _blend_of(inputs):
-    dd = adsk.core.DropDownCommandInput.cast(inputs.itemById('blend'))
+    dd = adsk.core.DropDownCommandInput.cast(_find(inputs, 'blend'))
     return dict(BLENDS)[dd.selectedItem.name]
 
 
@@ -850,7 +881,7 @@ def _add_var_inputs(inputs, spec=None, context='create', sketch=None):
     grp.isExpanded = True
     grp.tooltip = ('Station 1 is where the helix starts. Each row after it says how many '
                    'turns on from the row above it sits, and the pitch and radius there. '
-                   'Click a row to see where it is on the preview.')
+                   'Click into a row and the run it describes lights up on the preview.')
     ch = grp.children
     cnt = ch.addIntegerSpinnerCommandInput('stations', 'Stations', 2, MAX_STATIONS, 1, n)
     cnt.isEnabled = context != 'edit_feature'   # a feature's parameters are fixed
@@ -865,27 +896,43 @@ def _add_var_inputs(inputs, spec=None, context='create', sketch=None):
                   'curvature continuous, so a sweep along it has no crease at a station. '
                   'Linear ramps in a straight line, which is what SOLIDWORKS does.')
 
-    table = ch.addTableCommandInput('table', 'Stations', 4, '2:3:3:3')
+    table = ch.addTableCommandInput('table', 'Stations', 4, '1:4:3:3')
     table.minimumVisibleRows = 3
-    table.maximumVisibleRows = MAX_STATIONS + 1
+    table.maximumVisibleRows = n + 1     # no blank rows reserved under the table
     table.tablePresentationStyle = adsk.core.TablePresentationStyles.itemBorderTablePresentationStyle
     tc = table.commandInputs
-    for hid, label in (('h_station', 'Station'), ('h_turns', 'Turns from previous'),
-                       ('h_pitch', 'Pitch'), ('h_radius', 'Radius')):
-        tc.addTextBoxCommandInput(hid, '', '<b>%s</b>' % label, 1, True)
-    tc.addTextBoxCommandInput('t_start', '', 'start', 1, True)
-    # Every cell that could ever be needed exists from the start; the table
-    # shows the ones in use. turns<k> is the gap after station k, shown on the
-    # row of station k+1 so that reading down each row says how far on it is.
-    for i in range(MAX_STATIONS):
-        src = stations[i] if i < len(stations) else stations[-1]
-        k = i + 1
-        tc.addTextBoxCommandInput('s%d' % k, '', '<b>%d</b>' % k, 1, True)
-        tc.addValueInput('turns%d' % k, 'Turns', '', _seed(spec, 'turns%d' % k, src.get('turns', 1.0)))
-        tc.addValueInput('pitch%d' % k, 'Pitch', lu, _seed(spec, 'pitch%d' % k, src.get('pitch', 1.0)))
-        tc.addValueInput('radius%d' % k, 'Radius', lu, _seed(spec, 'radius%d' % k, src.get('radius', 2.0)))
+    for c, (hid, label) in enumerate((('h_station', 'Station'), ('h_turns', 'Turns from previous'),
+                                      ('h_pitch', 'Pitch'), ('h_radius', 'Radius'))):
+        table.addCommandInput(tc.addTextBoxCommandInput(hid, '', '<b>%s</b>' % label, 1, True), 0, c)
+    # turns<k> is the gap after station k, shown on the row of station k+1 so
+    # that reading down each row says how far on from the one above it sits.
+    gaps = [st['turns'] for st in stations if 'turns' in st] or [1.0]
+    for k in range(1, n + 1):
+        st = stations[min(k - 1, len(stations) - 1)]
+        _add_station_row(table, k,
+                         _seed(spec, 'turns%d' % (k - 1), gaps[min(k - 2, len(gaps) - 1)]) if k >= 2 else None,
+                         _seed(spec, 'pitch%d' % k, st.get('pitch', 1.0)),
+                         _seed(spec, 'radius%d' % k, st.get('radius', 2.0)), lu)
     tb = ch.addTextBoxCommandInput('readout', '', '', 1, True)
     tb.isFullWidth = True
+
+    ends = inputs.addGroupCommandInput('ends_grp', 'Ends')
+    ends.isExpanded = True
+    ends.tooltip = ('Natural starts or finishes at the station as it stands. Flat adds a run '
+                    'at the pitch you give, for the flat turns, then eases into the station '
+                    'over the transition turns. Zero pitch is a true flat, which is what a '
+                    'timing screw dwell wants. A closed spring end wants the wire diameter, '
+                    'or the sweep passes through itself.')
+    ec = ends.children
+    for side, label in (('start', 'Start'), ('end', 'End')):
+        dd = ec.addDropDownCommandInput(side + 'Type', label, adsk.core.DropDownStyles.TextListDropDownStyle)
+        cur = spec.get(side + 'Type', 'natural')
+        for l, key in END_TYPES:
+            dd.listItems.add(l, key == cur)
+        dd.isEnabled = context != 'edit_feature'   # decides which parameters the feature owns
+        ec.addValueInput(side + 'Pitch', label + ' flat pitch', lu, _seed(spec, side + 'Pitch', 0.0))
+        ec.addValueInput(side + 'Flat', label + ' flat turns', '', _seed(spec, side + 'Flat', 0.75))
+        ec.addValueInput(side + 'Blend', label + ' transition turns', '', _seed(spec, side + 'Blend', 0.5))
 
     wnd = inputs.addGroupCommandInput('winding_grp', 'Winding')
     wnd.isExpanded = True
@@ -902,9 +949,21 @@ def _add_var_inputs(inputs, spec=None, context='create', sketch=None):
     if context == 'create' and _in_sketch():
         inputs.addBoolValueInput('asFeature', 'Finish sketch and create parametric feature', True, '', False)
 
-    _rebuild_station_table(inputs)
     _apply_var_visibility(inputs)
     _update_var_readout(inputs)
+
+
+def _add_station_row(table, k, turns, pitch, radius, lu):
+    """Row k of the table, station k. The seeds are ValueInputs; turns is
+    ignored for row 1, which is the start and has nothing before it."""
+    tc = table.commandInputs
+    table.addCommandInput(tc.addTextBoxCommandInput('s%d' % k, '', '<b>%d</b>' % k, 1, True), k, 0)
+    if k == 1:
+        table.addCommandInput(tc.addTextBoxCommandInput('t_start', '', 'start', 1, True), k, 1)
+    else:
+        table.addCommandInput(tc.addValueInput('turns%d' % (k - 1), 'Turns', '', turns), k, 1)
+    table.addCommandInput(tc.addValueInput('pitch%d' % k, 'Pitch', lu, pitch), k, 2)
+    table.addCommandInput(tc.addValueInput('radius%d' % k, 'Radius', lu, radius), k, 3)
 
 
 def _size_var_dialog(cmd):
@@ -917,47 +976,52 @@ def _size_var_dialog(cmd):
 
 
 def _rebuild_station_table(inputs):
-    """Show exactly as many rows as the station count asks for. The cells all
-    exist already, so changing the count keeps whatever was typed. A cell that
-    is not in a row gets drawn as a loose input under the table, so everything
-    not in use is hidden."""
-    table = adsk.core.TableCommandInput.cast(inputs.itemById('table'))
-    n = adsk.core.IntegerSpinnerCommandInput.cast(inputs.itemById('stations')).value
-    tc = table.commandInputs
-    table.clear()
-    placed = set()
-
-    def put(cid, row, col):
-        inp = tc.itemById(cid)
-        table.addCommandInput(inp, row, col)
-        inp.isVisible = True
-        placed.add(cid)
-
-    for c, hid in enumerate(('h_station', 'h_turns', 'h_pitch', 'h_radius')):
-        put(hid, 0, c)
-    for k in range(1, n + 1):
-        put('s%d' % k, k, 0)
-        put('t_start' if k == 1 else 'turns%d' % (k - 1), k, 1)
-        put('pitch%d' % k, k, 2)
-        put('radius%d' % k, k, 3)
-    for i in range(tc.count):
-        inp = tc.item(i)
-        if inp.id not in placed:
-            inp.isVisible = False
+    """Match the rows to the station count. Rows are made as the count goes up,
+    seeded from the row above, and deleted as it comes down, which takes their
+    cells with them. Nothing exists that is not on show: a cell outside a row
+    draws itself as a loose input under the table."""
+    table = adsk.core.TableCommandInput.cast(_find(inputs, 'table'))
+    n = adsk.core.IntegerSpinnerCommandInput.cast(_find(inputs, 'stations')).value
+    lu = app.activeProduct.unitsManager.defaultLengthUnits
+    have = table.rowCount - 1          # less the header row
+    while have > n:
+        table.deleteRow(have)
+        have -= 1
+    table.maximumVisibleRows = n + 1
+    while have < n:
+        prev = lambda col: adsk.core.ValueCommandInput.cast(table.getInputAtPosition(have, col))
+        above = prev(1)                # row 1 holds the "start" label there, not a value
+        turns = (adsk.core.ValueInput.createByString(above.expression) if above
+                 else adsk.core.ValueInput.createByReal(1.0))
+        _add_station_row(table, have + 1, turns,
+                         adsk.core.ValueInput.createByString(prev(2).expression),
+                         adsk.core.ValueInput.createByString(prev(3).expression), lu)
+        have += 1
 
 
 def _var_focus_range(spec):
-    """(from, to) in turns for the part of the helix the dialog is on, or None."""
+    """(from, to) in turns for the part of the helix the dialog is on, or None.
+    A row lights the run from the station above down to its own station; the
+    ends light their flat and transition, or a short stretch if natural."""
     if not _var_focus or spec.get('mode') != MODE_VAR:
         return None
-    xs, _, _ = _station_axes(spec['stations'])
-    kind, k = _var_focus
-    if kind == 'span':                      # the run from station k to k+1
-        if 1 <= k < len(xs):
-            return xs[k - 1], xs[k]
-    elif 1 <= k <= len(xs):                 # a third of a turn either side of station k
-        c = xs[k - 1]
-        return max(0.0, c - 0.35), min(xs[-1], c + 0.35)
+    xs, _, _ = _station_axes(_expanded_stations(spec))
+    o = 2 if spec.get('startType') == 'flat' else 0      # user station k sits at xs[k-1+o]
+    n = len(spec['stations'])
+    head = (0.0, xs[o] if o else min(0.35, xs[-1]))
+    kind = _var_focus[0]
+    if kind == 'row':
+        k = _var_focus[1]
+        if k == 1:
+            return head
+        if 2 <= k <= n:
+            return xs[k - 2 + o], xs[k - 1 + o]
+    elif kind == 'start':
+        return head
+    elif kind == 'end':
+        if spec.get('endType') == 'flat':
+            return xs[n - 1 + o], xs[-1]
+        return max(0.0, xs[-1] - 0.35), xs[-1]
     return None
 
 
@@ -966,10 +1030,58 @@ def _build_highlight(spec):
     rng = _var_focus_range(spec)
     if not rng or rng[1] - rng[0] <= 1e-9:
         return None
-    P, U = var_helix_nurbs(spec['stations'], spec['startAngle'], spec['hand'] == 'right',
+    P, U = var_helix_nurbs(_expanded_stations(spec), spec['startAngle'], spec['hand'] == 'right',
                            spec.get('blend', 'smooth') == 'smooth', bool(spec.get('flip')),
                            PREVIEW_SAMPLES_PER_TURN, rng)
     return _curve_from(P, U, spec.get('xform'))
+
+
+class VarPoll(adsk.core.CustomEventHandler):
+    """Fusion fires nothing when a table row is clicked, only when a value
+    changes. A thread ticks this event while the dialog is open; here, on the
+    main thread, the selected row is compared with the last one seen and the
+    preview is redrawn when it has moved."""
+    def notify(self, args):
+        global _var_last_row, _var_focus
+        try:
+            cmd = _var_cmd
+            if cmd is None or not cmd.isValid:
+                return
+            table = adsk.core.TableCommandInput.cast(_find(cmd.commandInputs, 'table'))
+            if not table:
+                return
+            row = table.selectedRow
+            if row == _var_last_row:
+                return
+            _var_last_row = row
+            if row >= 1:
+                _var_focus = ('row', row)
+                cmd.doExecutePreview()
+        except Exception:
+            _log('Helix3D row watch failed:\n' + traceback.format_exc())
+
+
+def _start_var_poll(cmd):
+    global _var_cmd, _var_poll_stop, _var_last_row
+    _stop_var_poll()
+    _var_cmd, _var_last_row = cmd, -2
+    stop = threading.Event()
+    _var_poll_stop = stop
+
+    def tick():
+        while not stop.wait(0.15):
+            try:
+                app.fireCustomEvent(VAR_POLL_EVT)
+            except Exception:
+                break
+    threading.Thread(target=tick, daemon=True).start()
+
+
+def _stop_var_poll():
+    global _var_cmd, _var_poll_stop
+    if _var_poll_stop is not None:
+        _var_poll_stop.set()
+    _var_cmd, _var_poll_stop = None, None
 
 
 def _show_highlight(spec, comp, xf):
@@ -992,24 +1104,34 @@ def _show_highlight(spec, comp, xf):
         pass
 
 
+def _end_type(inputs, side):
+    dd = adsk.core.DropDownCommandInput.cast(_find(inputs, side + 'Type'))
+    return dict(END_TYPES)[dd.selectedItem.name]
+
+
 def _apply_var_visibility(inputs):
     has_start = _effective_point(inputs, 'start') is not None
     has_center = _effective_point(inputs, 'center') is not None
-    inputs.itemById('startAngle').isVisible = not has_start
+    _find(inputs, 'startAngle').isVisible = not has_start
     _apply_placement_visibility(inputs, not (has_center and has_start))
+    for side in ('start', 'end'):
+        flat = _end_type(inputs, side) == 'flat'
+        for f in END_FIELDS:
+            _find(inputs, side + f).isVisible = flat
 
 
 def _update_var_readout(inputs):
     """Height and turns fall out of the table, so show them rather than asking
     for them. It doubles as where a bad station gets reported."""
-    tb = adsk.core.TextBoxCommandInput.cast(inputs.itemById('readout'))
+    tb = adsk.core.TextBoxCommandInput.cast(_find(inputs, 'readout'))
     if not tb:
         return
     um = app.activeProduct.unitsManager
     try:
         spec = _read_var_spec(inputs)
-        height = var_helix_height(spec['stations'], spec['blend'] == 'smooth')
-        turns = sum(st.get('turns', 0.0) for st in spec['stations'][:-1])
+        sts = _expanded_stations(spec)
+        height = var_helix_height(sts, spec['blend'] == 'smooth')
+        turns = sum(st.get('turns', 0.0) for st in sts[:-1])
         tb.formattedText = 'Height %s over %s turns' % (
             um.formatInternalValue(height, um.defaultLengthUnits, True),
             um.formatInternalValue(turns, '', False))
@@ -1022,12 +1144,12 @@ def _update_var_readout(inputs):
 def _read_var_spec(inputs, sketch=None):
     """Spec dict for the variable pitch dialog, in internal units, with the
     expressions typed into each cell."""
-    n = adsk.core.IntegerSpinnerCommandInput.cast(inputs.itemById('stations')).value
+    n = adsk.core.IntegerSpinnerCommandInput.cast(_find(inputs, 'stations')).value
     spec = {
         'mode': MODE_VAR,
         'hand': 'right' if adsk.core.DropDownCommandInput.cast(
-            inputs.itemById('hand')).selectedItem.name.startswith('Right') else 'left',
-        'flip': adsk.core.BoolValueCommandInput.cast(inputs.itemById('flip')).value,
+            _find(inputs, 'hand')).selectedItem.name.startswith('Right') else 'left',
+        'flip': adsk.core.BoolValueCommandInput.cast(_find(inputs, 'flip')).value,
         'blend': _blend_of(inputs),
         'stations': [],
         'expr': {},
@@ -1039,13 +1161,22 @@ def _read_var_spec(inputs, sketch=None):
                 continue
             key = '%s%d' % (base, i + 1)
             box = adsk.core.ValueCommandInput.cast(_cell(inputs, key))
+            if box is None:
+                raise HelixError('The station table is missing its %s cell.' % key)
             st[base] = box.value
             spec[key] = box.value
             spec['expr'][key] = box.expression
         spec['stations'].append(st)
-    sa = adsk.core.ValueCommandInput.cast(inputs.itemById('startAngle'))
+    sa = adsk.core.ValueCommandInput.cast(_find(inputs, 'startAngle'))
     spec['startAngle'] = sa.value
     spec['expr']['startAngle'] = sa.expression
+    for side in ('start', 'end'):
+        spec[side + 'Type'] = _end_type(inputs, side)
+        if spec[side + 'Type'] == 'flat':
+            for f in END_FIELDS:
+                box = adsk.core.ValueCommandInput.cast(_find(inputs, side + f))
+                spec[side + f] = box.value
+                spec['expr'][side + f] = box.expression
     _read_placement(spec, inputs, sketch)
     return spec
 
@@ -1053,7 +1184,7 @@ def _read_var_spec(inputs, sketch=None):
 def _read_any_spec(inputs, sketch=None):
     """Whichever dialog is open. The variable pitch one is the one with a
     station count."""
-    if inputs.itemById('stations'):
+    if _find(inputs, 'stations'):
         return _read_var_spec(inputs, sketch)
     return _read_spec(inputs, sketch)
 
@@ -1118,8 +1249,42 @@ def _station_ids(n):
     return tuple(ids)
 
 
-def _var_param_ids(n):
-    return _station_ids(n) + ('startAngle',)
+def _end_param_ids(spec):
+    ids = []
+    for side in ('start', 'end'):
+        if spec.get(side + 'Type') == 'flat':
+            ids += [side + f for f in END_FIELDS]
+    return tuple(ids)
+
+
+def _var_param_ids(spec):
+    return _station_ids(len(spec['stations'])) + _end_param_ids(spec) + ('startAngle',)
+
+
+def _expanded_stations(spec):
+    """The stations with any flat ends added on. A flat end is a run at the
+    end pitch for the flat turns, then the transition turns into the first (or
+    out of the last) station. Two stations at one pitch give an exactly flat
+    run, so the solver needs nothing new to know about."""
+    sts = [dict(st) for st in spec['stations']]
+    for side in ('start', 'end'):
+        if spec.get(side + 'Type') != 'flat' or not sts:
+            continue
+        p, flat, blend = (spec.get(side + f, 0.0) for f in END_FIELDS)
+        if p < -1e-9:
+            raise HelixError('%s flat pitch cannot be negative.' % side.capitalize())
+        if flat <= 1e-9 or blend <= 1e-9:
+            raise HelixError('%s flat turns and transition turns both have to be more than zero.'
+                             % side.capitalize())
+        if side == 'start':
+            r = sts[0].get('radius', 0.0)
+            sts = [{'turns': flat, 'pitch': p, 'radius': r},
+                   {'turns': blend, 'pitch': p, 'radius': r}] + sts
+        else:
+            r = sts[-1].get('radius', 0.0)
+            sts[-1]['turns'] = blend
+            sts += [{'turns': flat, 'pitch': p, 'radius': r}, {'pitch': p, 'radius': r}]
+    return sts
 
 
 def _var_param_meta(pid):
@@ -1177,6 +1342,10 @@ PARAM_META = {  # id: (display name, unit key)
     'pitch': ('Pitch', 'len'), 'height': ('Height', 'len'),
     'turns': ('Revolutions', ''), 'taper': ('Taper Angle', 'deg'),
     'startAngle': ('Start Angle', 'deg'),
+    'startPitch': ('Start flat pitch', 'len'), 'startFlat': ('Start flat turns', ''),
+    'startBlend': ('Start transition turns', ''),
+    'endPitch': ('End flat pitch', 'len'), 'endFlat': ('End flat turns', ''),
+    'endBlend': ('End transition turns', ''),
 }
 
 
@@ -1288,6 +1457,8 @@ def _spec_of_feature(cf):
         spec['expr'][p.id] = p.expression   # so reopening the dialog keeps it
     if spec['mode'] == MODE_VAR:
         spec['blend'] = cf.customNamedValues.value('blend') or 'smooth'
+        spec['startType'] = cf.customNamedValues.value('startType') or 'natural'
+        spec['endType'] = cf.customNamedValues.value('endType') or 'natural'
         spec['stations'] = [{} for _ in range(int(cf.customNamedValues.value('stations') or 0))]
         _stations_from_values(spec)
     return spec
@@ -1367,7 +1538,9 @@ def _is_helix_curve(entity):
 
 
 UNIT_OF = {'radius': 'len', 'endRadius': 'len', 'pitch': 'len', 'height': 'len',
-           'turns': '', 'taper': 'deg', 'startAngle': 'deg'}
+           'turns': '', 'taper': 'deg', 'startAngle': 'deg',
+           'startPitch': 'len', 'startFlat': '', 'startBlend': '',
+           'endPitch': 'len', 'endFlat': '', 'endBlend': ''}
 
 
 def _units():
@@ -1481,7 +1654,7 @@ class TriadActivate(adsk.core.CommandEventHandler):
             if _pending_triad is None:
                 return
             inputs = adsk.core.CommandEventArgs.cast(args).command.commandInputs
-            tri = adsk.core.TriadCommandInput.cast(inputs.itemById('placement'))
+            tri = adsk.core.TriadCommandInput.cast(_find(inputs, 'placement'))
             if tri:
                 tri.transform = _pending_triad
         except Exception:
@@ -1502,8 +1675,8 @@ class InputChanged(adsk.core.InputChangedEventHandler):
                 _touched.add(cid)
             if cid == 'center':
                 _triad_follow_center(inputs)
-            if inputs.itemById('stations'):      # the variable pitch dialog
-                global _var_focus
+            if _find(inputs, 'stations'):      # the variable pitch dialog
+                global _var_focus, _var_last_row
                 base = cid.rstrip('0123456789')
                 if cid == 'stations':
                     _rebuild_station_table(inputs)
@@ -1511,11 +1684,15 @@ class InputChanged(adsk.core.InputChangedEventHandler):
                 elif cid == 'table':                # a row was clicked
                     row = adsk.core.TableCommandInput.cast(args.input).selectedRow
                     if row >= 1:
-                        _var_focus = ('station', row)
+                        _var_focus, _var_last_row = ('row', row), row
                 elif base != cid and base in ('pitch', 'radius'):
-                    _var_focus = ('station', int(cid[len(base):]))
-                elif base != cid and base == 'turns':
-                    _var_focus = ('span', int(cid[len(base):]))
+                    _var_focus = ('row', int(cid[len(base):]))
+                elif base != cid and base == 'turns':   # the gap after station j is on row j+1
+                    _var_focus = ('row', int(cid[len(base):]) + 1)
+                elif cid.startswith('start') and cid != 'startAngle':
+                    _var_focus = ('start',)
+                elif cid.startswith('end'):
+                    _var_focus = ('end',)
                 _apply_var_visibility(inputs)
                 _update_var_readout(inputs)
                 _advance_focus(inputs, cid)
@@ -1577,7 +1754,7 @@ def _advance_focus(inputs, changed_id):
 def _triad_follow_center(inputs):
     """Sit the triad on the centre point so its position isn't misleading."""
     global _triad_last
-    tri = adsk.core.TriadCommandInput.cast(inputs.itemById('placement'))
+    tri = adsk.core.TriadCommandInput.cast(_find(inputs, 'placement'))
     c = _effective_point(inputs, 'center')
     if not tri or c is None:
         return
@@ -1589,7 +1766,7 @@ def _triad_follow_center(inputs):
 
 
 def _remember_placement_group(inputs):
-    grp = inputs.itemById('placement_grp')
+    grp = _find(inputs, 'placement_grp')
     if grp and _settings.get('placementExpanded', True) != grp.isExpanded:
         _settings['placementExpanded'] = grp.isExpanded
         _save_settings()
@@ -1623,7 +1800,7 @@ def _create_feature(comp, plane, spec, center_ent=None, start_ent=None, path_ent
     sk = _create_sketch(comp, plane, spec, center_ent, start_ent, path_ent)
 
     cfi = comp.features.customFeatures.createInput(_def_var if var else _def)
-    pids = _var_param_ids(len(spec['stations'])) if var else _param_ids(spec['mode'], spec.get('taperBy', 'angle'))
+    pids = _var_param_ids(spec) if var else _param_ids(spec['mode'], spec.get('taperBy', 'angle'))
     for pid in pids:
         name, ukey = _var_param_meta(pid) if var else PARAM_META[pid]
         cfi.addCustomParameter(pid, name, adsk.core.ValueInput.createByString(spec['expr'][pid]),
@@ -1643,6 +1820,8 @@ def _create_feature(comp, plane, spec, center_ent=None, start_ent=None, path_ent
     if var:
         cf.customNamedValues.addOrSetValue('blend', spec.get('blend', 'smooth'))
         cf.customNamedValues.addOrSetValue('stations', str(len(spec['stations'])))
+        cf.customNamedValues.addOrSetValue('startType', spec.get('startType', 'natural'))
+        cf.customNamedValues.addOrSetValue('endType', spec.get('endType', 'natural'))
     else:
         cf.customNamedValues.addOrSetValue('taperBy', spec.get('taperBy', 'angle'))
     return cf
@@ -1713,6 +1892,7 @@ class CreatePreview(adsk.core.CommandEventHandler):
 
 class CreateDestroy(adsk.core.CommandEventHandler):
     def notify(self, args):
+        _stop_var_poll()
         _show_origin(False)
         try:
             _remember_placement_group(adsk.core.CommandEventArgs.cast(args).command.commandInputs)
@@ -1734,6 +1914,7 @@ class CreateCreated(adsk.core.CommandCreatedEventHandler):
             build(cmd.commandInputs, context='create', sketch=_in_sketch())
             if self.variable:
                 _size_var_dialog(cmd)
+                _start_var_poll(cmd)
             if not _in_sketch():
                 _show_origin(True)
             _wire(cmd, CreateExecute(), TriadActivate() if _in_sketch() else None, CreateDestroy(),
@@ -1895,6 +2076,7 @@ class EditPreSelect(adsk.core.SelectionEventHandler):
 class EditDestroy(adsk.core.CommandEventHandler):
     def notify(self, args):
         global _editing, _editing_xf, _editing_restore
+        _stop_var_poll()
         try:
             _restore_timeline()
             sk = _sketch_of(_editing)
@@ -1926,6 +2108,7 @@ class EditCreated(adsk.core.CommandCreatedEventHandler):
             build(cmd.commandInputs, spec, context='edit_feature')
             if spec['mode'] == MODE_VAR:
                 _size_var_dialog(cmd)
+                _start_var_poll(cmd)
             _wire(cmd, EditExecute(), EditActivate(), EditDestroy(), EditPreview())
             h = EditPreSelect()
             cmd.preSelect.add(h)
@@ -1969,6 +2152,7 @@ class SketchEditPreview(adsk.core.CommandEventHandler):
 class SketchEditDestroy(adsk.core.CommandEventHandler):
     def notify(self, args):
         global _editing_curve
+        _stop_var_poll()
         try:
             _remember_placement_group(adsk.core.CommandEventArgs.cast(args).command.commandInputs)
         except Exception:
@@ -2015,6 +2199,7 @@ class SketchEditCreated(adsk.core.CommandCreatedEventHandler):
             build(cmd.commandInputs, spec, context='edit_sketch', sketch=curve.parentSketch)
             if spec['mode'] == MODE_VAR:
                 _size_var_dialog(cmd)
+                _start_var_poll(cmd)
             _wire(cmd, SketchEditExecute(), SketchEditActivate(), SketchEditDestroy(), SketchEditPreview())
         except Exception:
             ui.messageBox('Helix3D sketch edit command failed:\n' + traceback.format_exc())
@@ -2097,6 +2282,11 @@ def run(context):
         app.registerCustomEvent(TOUCH_EVT).add(h)
         _handlers.append(h)
 
+        app.unregisterCustomEvent(VAR_POLL_EVT)
+        h = VarPoll()
+        app.registerCustomEvent(VAR_POLL_EVT).add(h)
+        _handlers.append(h)
+
         h = CommandTerminated()
         ui.commandTerminated.add(h)
         _handlers.append(h)
@@ -2115,7 +2305,9 @@ def run(context):
 
 def stop(context):
     try:
+        _stop_var_poll()
         app.unregisterCustomEvent(TOUCH_EVT)
+        app.unregisterCustomEvent(VAR_POLL_EVT)
         for pid in PANELS:
             panel = ui.allToolbarPanels.itemById(pid)
             for cid in (CMD_ID, VAR_CMD_ID):

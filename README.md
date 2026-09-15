@@ -64,7 +64,9 @@ Same thing, but you say how many turns to fit along the path rather than the pit
 
 This one is a second command, **Variable Pitch Helix**, for a helix whose pitch changes along its length. Fusion's Coil holds one pitch the whole way. Inventor's adds a transition and a flat end, which covers a closed-end spring and nothing else. This command takes a table instead.
 
-You give it a table of stations. Station 1 is where the helix starts. Each row carries a pitch and a radius, and each row after the first says how many turns on from the row above it sits. Pitch is the rise per turn, so the height is not something you type: it falls out of the table, and the dialog tells you what it came to. Click a row, or type in one, and that part of the helix lights up orange in the preview so you can see which station you are on.
+You give it a table of stations. Station 1 is where the helix starts. Each row carries a pitch and a radius, and each row after the first says how many turns on from the row above it sits. Pitch is the rise per turn, so the height is not something you type: it falls out of the table, and the dialog tells you what it came to. Click into a row and the run it describes, from the station above down to its own, lights up orange in the preview so you can see which station you are on.
+
+**Ends** does what Inventor's coil ends do. Each end is Natural, which starts or finishes at the station as it stands, or Flat, which adds a run at the pitch you give for so many turns and then eases into the station over the transition turns. A pitch of zero is a true flat, which is what a timing screw dwell wants. For a closed spring end give it the wire diameter, or the sweep passes through itself.
 
 Two jobs it was built for:
 
@@ -144,7 +146,7 @@ Radius, start angle and direction apply to all of them. Taper applies to everyth
 - The path modes take one curve at a time, a sketch curve or a body edge. Chained curves are not supported yet, so a path made of several joined segments needs to be one curve.
 - Wind a helix around a tight corner with a radius larger than the corner and it will pass through itself. That is the geometry, not a bug, but the add-in does not warn you about it.
 - A centre or start point has to come earlier in the timeline than the helix. Points that come later will not highlight when you try to pick them.
-- The number of stations on a variable pitch helix is fixed once you make it a feature, for the same reason Mode is: Fusion decides which parameters a custom feature owns when it is created. Changing the count means a new helix. In a sketch you can change it whenever you like.
+- The number of stations on a variable pitch helix, and whether each end is Natural or Flat, are fixed once you make it a feature, for the same reason Mode is: Fusion decides which parameters a custom feature owns when it is created. Changing either means a new helix. In a sketch you can change them whenever you like.
 - On a variable pitch helix a start point sets the start angle and the height it starts at, but not the radius, because the radii come from the table.
 - Give a spring a pitch smaller than the wire you sweep along it and the coils will pass through each other. Same for a timing screw with a dwell narrower than the flight. The add-in does not check for it.
 - Developed against Fusion 2705.1.15 on Windows. It should be fine on Mac, I just have not tested it there.
