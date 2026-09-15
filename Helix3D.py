@@ -208,15 +208,22 @@ def _rmf(samples, up):
     return frames
 
 
-def path_helix_nurbs(sampler, r0, dr, turns, start_ang, right_hand, up, per_turn=SAMPLES_PER_TURN):
+def path_helix_nurbs(sampler, r0, dr, turns, start_ang, right_hand, up,
+                     per_turn=SAMPLES_PER_TURN, flip=False):
     """Helix wound around a path. sampler(ts) -> [(point, tangent), ...] at
-    those fractions of the path's arc length, in the sampler's own space."""
+    those fractions of the path's arc length, in the sampler's own space.
+    flip walks the path from the far end instead."""
     n = _sample_count(turns, per_turn)
     d = 0.1 / n   # two extra samples at each end for second-order end tangents
     ts = [0.0, d, 2 * d] + [k / n for k in range(1, n)] + [1.0 - 2 * d, 1.0 - d, 1.0]
     total_ang = 2 * math.pi * turns * (1 if right_hand else -1)
+    samples = sampler([1.0 - t for t in ts] if flip else ts)
+    if flip:
+        # Tangents come back along increasing parameter, so they point behind
+        # us now. Turning them round keeps the winding the same hand.
+        samples = [(p, (-vx, -vy, -vz)) for p, (vx, vy, vz) in samples]
     Q = []
-    for t, (p, tv, r, b) in zip(ts, _rmf(sampler(ts), up)):
+    for t, (p, tv, r, b) in zip(ts, _rmf(samples, up)):
         a = start_ang + total_ang * t
         rad = r0 + dr * t
         Q.append(tuple(p[c] + rad * (math.cos(a) * r[c] + math.sin(a) * b[c]) for c in range(3)))
@@ -329,17 +336,24 @@ def build_curve(spec, per_turn=SAMPLES_PER_TURN):
     """NurbsCurve3D in sketch space from a spec dict. per_turn is dropped for
     previews, where the curve only has to look right; everything that gets
     committed is built at the full sample rate."""
+    # A flat spiral has no axis to run along, so flipping it would only change
+    # which way it winds, which is what Direction is for.
+    flip = bool(spec.get('flip')) and spec['mode'] != MODE_SPIRAL
     if spec['mode'] in PATH_MODES:
         if not spec.get('_sampler'):
             raise HelixError('Pick a path for the helix to follow.')
         r0, dr, height, turns = resolve(spec)
         P, U = path_helix_nurbs(spec['_sampler'], r0, dr, turns, spec['startAngle'],
-                                spec['hand'] == 'right', spec['_up'], per_turn)
+                                spec['hand'] == 'right', spec['_up'], per_turn, flip)
         pts = [adsk.core.Point3D.create(*p) for p in P]
         for pt in pts:
             pt.transformBy(spec['_Si'])   # path is sampled in model space
         return adsk.core.NurbsCurve3D.createNonRational(pts, 3, U, False)
     r0, dr, height, turns = resolve(spec)
+    if flip:
+        # Reverse the climb and the sweep together. Reversing only the climb
+        # would turn a right hand helix into a left hand one.
+        height, turns = -height, -turns
     P, U = helix_nurbs(r0, dr, height, turns, spec['startAngle'], spec['hand'] == 'right', per_turn)
     pts = [adsk.core.Point3D.create(*p) for p in P]
     xf = spec.get('xform')
@@ -468,6 +482,9 @@ def _add_inputs(inputs, spec=None, context='create', sketch=None):
     rh = spec.get('hand', 'right') == 'right'
     hd.listItems.add('Right hand', rh)
     hd.listItems.add('Left hand', not rh)
+    fl = inputs.addBoolValueInput('flip', 'Flip direction', True, '', bool(spec.get('flip')))
+    fl.tooltip = ('Run the helix the other way: down the axis instead of up, or from the far '
+                  'end of the path back. The winding stays right or left handed either way.')
 
     if sketch is not None:  # in-sketch create or edit: placement triad
         grp = inputs.addGroupCommandInput('placement_grp', 'Placement')
@@ -507,6 +524,7 @@ def _apply_mode_visibility(inputs):
     for k in ('endRadius', 'pitch', 'height', 'turns', 'taper'):
         inputs.itemById(k).isVisible = k in show
     inputs.itemById('taperBy').isVisible = mode != MODE_SPIRAL
+    inputs.itemById('flip').isVisible = mode != MODE_SPIRAL
     # The plane only matters as the sketch the curve lives in and the reference
     # for the zero start angle; along a path both default to the path's sketch.
     for sid, vis in (('plane', not path_mode), ('path', path_mode), ('center', not path_mode), ('start', not path_mode)):
@@ -543,6 +561,7 @@ def _read_spec(inputs, sketch=None):
         'mode': adsk.core.DropDownCommandInput.cast(inputs.itemById('mode')).selectedItem.name,
         'hand': 'right' if adsk.core.DropDownCommandInput.cast(
             inputs.itemById('hand')).selectedItem.name.startswith('Right') else 'left',
+        'flip': adsk.core.BoolValueCommandInput.cast(inputs.itemById('flip')).value,
         'taperBy': _taper_by(inputs),
         'expr': {},
     }
@@ -731,6 +750,7 @@ def _spec_of_feature(cf):
     spec = {'mode': cf.customNamedValues.value('mode') or MODE_RP,
             'hand': cf.customNamedValues.value('hand') or 'right',
             'taperBy': cf.customNamedValues.value('taperBy') or 'angle',
+            'flip': cf.customNamedValues.value('flip') == '1',
             '_deps': {k: _dep_entity(cf, k) for k in ('center', 'start', 'path')}}
     for i in range(cf.parameters.count):
         p = cf.parameters.item(i)
@@ -1051,6 +1071,7 @@ def _create_feature(comp, plane, spec, center_ent=None, start_ent=None, path_ent
     cf.customNamedValues.addOrSetValue('mode', spec['mode'])
     cf.customNamedValues.addOrSetValue('hand', spec['hand'])
     cf.customNamedValues.addOrSetValue('taperBy', spec.get('taperBy', 'angle'))
+    cf.customNamedValues.addOrSetValue('flip', '1' if spec.get('flip') else '0')
     return cf
 
 
@@ -1188,6 +1209,7 @@ class EditExecute(adsk.core.CommandEventHandler):
                 '%s=%s' % (cf.dependencies.item(i).id, _describe(cf.dependencies.item(i).entity))
                 for i in range(cf.dependencies.count)))
             cf.customNamedValues.addOrSetValue('hand', spec['hand'])
+            cf.customNamedValues.addOrSetValue('flip', '1' if spec.get('flip') else '0')
             for i in range(cf.parameters.count):
                 p = cf.parameters.item(i)
                 p.expression = spec['expr'][p.id]

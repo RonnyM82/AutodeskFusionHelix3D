@@ -120,6 +120,8 @@ An in-sketch helix follows its inputs the same way a feature does: type an expre
 
 Radius, start angle and direction apply to all of them. Taper applies to everything except the flat spiral, which already works in start and end radii.
 
+**Flip direction** runs the helix the other way: down the axis instead of up, or from the far end of the path back towards the start. It does not change whether the winding is right or left handed, so on a path helix with no taper and no change of radius there is nothing to see. Put a taper on it and the wide end swaps ends.
+
 ## Worth knowing
 
 - The path modes take one curve at a time, a sketch curve or a body edge. Chained curves are not supported yet, so a path made of several joined segments needs to be one curve.
