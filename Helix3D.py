@@ -1041,7 +1041,7 @@ def _var_focus_station(spec):
     if kind == 'row' and 1 <= _var_focus[1] <= n:
         return xs[_var_focus[1] - 1 + o]
     if kind == 'start':
-        return xs[o]
+        return 0.0
     if kind == 'end':
         return xs[-1]
     return None
@@ -1062,15 +1062,8 @@ def _helix_point(spec, u):
     return adsk.core.Point3D.create(*(P[-1] if tail else P[0]))
 
 
-def _point_at(spec, u, out=0.0):
-    """_helix_point with the helix's own placement applied. `out` pushes the
-    point that much further from the axis, to sit a label clear of the coil."""
-    p = _helix_point(spec, u)
-    if out:
-        r = math.hypot(p.x, p.y)
-        if r > 1e-9:
-            k = 1.0 + out / r
-            p = adsk.core.Point3D.create(p.x * k, p.y * k, p.z)
+def _placed(spec, p):
+    """A helix-local point with the helix's own placement applied."""
     xf = spec.get('xform')
     if xf:
         M = adsk.core.Matrix3D.create()
@@ -1079,10 +1072,34 @@ def _point_at(spec, u, out=0.0):
     return p
 
 
+def _point_at(spec, u):
+    return _placed(spec, _helix_point(spec, u))
+
+
 def _focus_size(spec):
     """Marker and text sized off the helix, so they stay in proportion."""
-    r = max([st.get('radius', 0.0) for st in spec['stations']] or [1.0])
-    return max(r * 0.30, 0.25), max(r * 0.13, 0.12)     # cross arm, text height
+    r = _helix_radius(spec)
+    return max(r * 0.15, 0.125), max(r * 0.065, 0.06)   # cross arm, text height
+
+
+def _helix_radius(spec):
+    return max([st.get('radius', 0.0) for st in spec['stations']] or [1.0])
+
+
+def _label_anchor(spec):
+    """Where the note sits: under the bottom of the helix, off to one side.
+    It stays put whichever row is picked, so the eye does not have to chase it
+    around the model."""
+    sts = _expanded_stations(spec)
+    xs, ps, _ = _station_axes(sts)
+    rise = _Ramp(xs, ps, spec.get('blend', 'smooth') == 'smooth').total()
+    if spec.get('flip'):
+        rise = -rise
+    r = _helix_radius(spec)
+    # Seen at an angle the bottom coil's own ellipse reaches about a radius
+    # below its centre, so the note drops a little past that to sit clear.
+    gap = max(r * 0.85, 0.45)
+    return _placed(spec, adsk.core.Point3D.create(-r, 0.0, min(0.0, rise) - gap))
 
 
 def _build_highlight(spec):
@@ -1116,8 +1133,10 @@ def _focus_label(spec):
         return None
     um = app.activeProduct.unitsManager
     lu = um.defaultLengthUnits
-    length = lambda v: um.formatInternalValue(v, lu, True)
-    turns = lambda v: um.formatInternalValue(v, '', False)
+    # formatInternalValue gives a value like 6.8333333 its full precision;
+    # two places is what the rest of the dialog shows.
+    length = lambda v: '%.2f %s' % (um.convert(v, 'cm', lu), lu)
+    turns = lambda v: '%.2f' % v
     st = spec['stations'][k - 1]
     rng = _var_focus_range(spec)
     if rng:
@@ -1125,19 +1144,23 @@ def _focus_label(spec):
         xs, ps, _ = _station_axes(sts)
         ramp = _Ramp(xs, ps, spec.get('blend', 'smooth') == 'smooth')
         rise = ramp.integral(rng[1]) - ramp.integral(rng[0])
-        head = '%s turns on, rising %s' % (turns(rng[1] - rng[0]), length(rise))
-        u = (rng[0] + rng[1]) / 2.0
+        span, climb = turns(rng[1] - rng[0]), length(rise)
+        if kind == 'start':
+            head = 'flat end, %s turns into it, rising %s' % (span, climb)
+        elif kind == 'end':
+            head = 'flat end, %s turns out of it, rising %s' % (span, climb)
+        else:
+            head = '%s turns on, rising %s' % (span, climb)
     else:
-        head = 'where the helix starts'
-        u = _var_focus_station(spec)
+        head = 'where the helix finishes' if kind == 'end' else 'where the helix starts'
     # Three short lines read better on a billboard than two long ones.
     text = 'Station %d\n%s\npitch %s, radius %s' % (
         k, head, length(st.get('pitch', 0.0)), length(st.get('radius', 0.0)))
-    r = max([t.get('radius', 0.0) for t in spec['stations']] or [1.0])
-    return text, _point_at(spec, u, r * 0.45), _focus_size(spec)[1]
+    return text, _label_anchor(spec), _focus_size(spec)[1]
 
 
-ORANGE = (255, 140, 0)
+ORANGE = (255, 140, 0)     # the lit run and the note
+BLUE = (0, 140, 255)       # the station cross, the add-in's own preview blue
 
 
 def _show_highlight(spec, comp, xf):
@@ -1154,14 +1177,16 @@ def _show_highlight(spec, comp, xf):
     if curve is None and mark is None and label is None:
         return
     g = comp.customGraphicsGroups.add()
-    paint = adsk.fusion.CustomGraphicsSolidColorEffect.create(adsk.core.Color.create(*(ORANGE + (255,))))
+    tint = lambda rgb: adsk.fusion.CustomGraphicsSolidColorEffect.create(
+        adsk.core.Color.create(*(rgb + (255,))))
+    paint = tint(ORANGE)
 
-    def draw(geom, weight):
+    def draw(geom, weight, rgb=ORANGE):
         e = g.addCurve(geom)
         if not e:
             return
         e.weight = weight
-        e.color = paint
+        e.color = tint(rgb)
         try:
             e.depthPriority = 1     # over the curve it sits on
         except Exception:
@@ -1169,14 +1194,14 @@ def _show_highlight(spec, comp, xf):
 
     if curve is not None:
         curve.transformBy(xf)
-        draw(curve, 5)
+        draw(curve, 3.5)
     if mark is not None:
         p, size = mark
         p.transformBy(xf)
         for dx, dy, dz in ((size, 0, 0), (0, size, 0), (0, 0, size)):
             draw(adsk.core.Line3D.create(
                 adsk.core.Point3D.create(p.x - dx, p.y - dy, p.z - dz),
-                adsk.core.Point3D.create(p.x + dx, p.y + dy, p.z + dz)), 3)
+                adsk.core.Point3D.create(p.x + dx, p.y + dy, p.z + dz)), 2.1, BLUE)
     if label is not None:
         text, p, height = label
         p.transformBy(xf)
@@ -1842,9 +1867,12 @@ class InputChanged(adsk.core.InputChangedEventHandler):
                     _var_focus = ('row', int(cid[len(base):]) + 1)
                     _var_last_row = _selected_row(inputs)
                 elif cid.startswith('start') and cid != 'startAngle':
-                    _var_focus = ('start',)
+                    # An Ends field was changed: show that end rather than
+                    # whichever table row happened to be picked last. Keeping
+                    # the row in step stops the row watcher taking it back.
+                    _var_focus, _var_last_row = ('start',), _selected_row(inputs)
                 elif cid.startswith('end'):
-                    _var_focus = ('end',)
+                    _var_focus, _var_last_row = ('end',), _selected_row(inputs)
                 _apply_var_visibility(inputs)
                 _update_var_readout(inputs)
                 _advance_focus(inputs, cid)
