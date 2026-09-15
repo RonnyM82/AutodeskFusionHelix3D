@@ -40,6 +40,7 @@ OUR_COMMANDS = (CMD_ID, EDIT_ID, SKETCH_EDIT_ID, VAR_CMD_ID, VAR_EDIT_ID)
 PANELS = ('SketchCreatePanel', 'SolidCreatePanel')
 ICONS = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'resources')
 VAR_ICONS = os.path.join(ICONS, 'variable')   # same helix, uneven coils
+TOOLCLIPS = os.path.join(ICONS, 'toolclips')  # pictures Fusion shows inside a tooltip
 ATTR_GROUP = 'Helix3D'
 SAMPLES_PER_TURN = 24
 PREVIEW_SAMPLES_PER_TURN = 12   # previews only have to look right; see build_curve
@@ -839,16 +840,25 @@ def _find(inputs, cid, depth=0):
     return None
 
 
-def _tip(inputs, cid, tip, description=None):
-    """Set the hover text on an input. Fusion shows `tooltip` straight away and
-    `tooltipDescription` underneath once the pointer rests there, so the first
-    is the label and the second is the explanation."""
+def _clip(name):
+    """Full path to a tool clip image, or empty if it is not there. A picture
+    that failed to ship must not take the dialog down with it."""
+    p = os.path.join(TOOLCLIPS, name)
+    return p if os.path.exists(p) else ''
+
+
+def _tip(inputs, cid, tip, description=None, clip=None):
+    """Set the hover text on an input. Fusion shows `tooltip` straight away,
+    then the tool clip picture and `tooltipDescription` once the pointer rests
+    there, so the first is the heading and the rest is the explanation."""
     inp = _find(inputs, cid)
     if not inp:
         return
     inp.tooltip = tip
     if description:
         inp.tooltipDescription = description
+    if clip:
+        inp.toolClipFilename = _clip(clip)
 
 
 def _cell(inputs, cid):
@@ -901,6 +911,7 @@ def _add_var_inputs(inputs, spec=None, context='create', sketch=None):
         'the pitch variable.<br><br>Click into any row and the preview shows you where that '
         'station is, lights up the run of helix that row controls, and writes out what it '
         'is doing.')
+    grp.toolClipFilename = _clip('stations.png')
     ch = grp.children
     cnt = ch.addIntegerSpinnerCommandInput('stations', 'Stations', 2, MAX_STATIONS, 1, n)
     cnt.isEnabled = context != 'edit_feature'   # a feature's parameters are fixed
@@ -911,6 +922,7 @@ def _add_var_inputs(inputs, spec=None, context='create', sketch=None):
         'This is greyed out when you edit a finished feature. Fusion decides which '
         'parameters a feature owns at the moment it is created and will not let them '
         'change afterwards, so a different number of stations means a new helix.')
+    cnt.toolClipFilename = _clip('stations.png')
     bl = ch.addDropDownCommandInput('blend', 'Blend', adsk.core.DropDownStyles.TextListDropDownStyle)
     cur_blend = spec.get('blend', 'smooth')
     for label, key in BLENDS:
@@ -923,6 +935,7 @@ def _add_var_inputs(inputs, spec=None, context='create', sketch=None):
         'It leaves a slight kink at each station.<br><br>The choice changes the height, '
         'because the height is the area under the pitch and the two shapes cover '
         'different areas.')
+    bl.toolClipFilename = _clip('blend.png')
 
     table = ch.addTableCommandInput('table', 'Stations', 4, '1:4:3:3')
     table.minimumVisibleRows = 3
@@ -950,6 +963,7 @@ def _add_var_inputs(inputs, spec=None, context='create', sketch=None):
     ends.tooltipDescription = (
         'The same idea as the coil ends in Inventor. Use this for the closed ends of a '
         'spring, or for a dwell on a timing screw.')
+    ends.toolClipFilename = _clip('ends.png')
     ec = ends.children
     for side, label in (('start', 'Start'), ('end', 'End')):
         dd = ec.addDropDownCommandInput(side + 'Type', label, adsk.core.DropDownStyles.TextListDropDownStyle)
@@ -1013,26 +1027,26 @@ def _add_var_tooltips(inputs):
          'when the helix is not already pinned by a centre point and a start point.')
     _tip(inputs, 'table', 'One row for each station, in order along the helix',
          'Row 1 is where the helix starts, which is why its turns cell reads start rather '
-         'than a number.')
+         'than a number.', 'pitch.png')
     _tip(inputs, 'readout', 'The height and the total turns, worked out from the table',
          'Height is the area under the pitch, not the pitch multiplied by the turns. Where '
          'the pitch is changing, a run rises by the average of the two pitches, not by '
-         'either one of them.')
+         'either one of them.', 'pitch-rise.png')
     for side, label, into in (('start', 'Start', 'into'), ('end', 'End', 'out of')):
         _tip(inputs, side + 'Type', 'How the %s of the helix is finished' % label.lower(),
              'Natural begins right at the station, with nothing added.<br><br>Flat adds a '
              'run of coil at a pitch you choose, then eases %s the station over the '
-             'transition turns.' % into)
+             'transition turns.' % into, 'ends.png')
         _tip(inputs, side + 'Pitch', 'How far the flat run climbs in one turn',
              'Set it to zero for a true flat, which is what a dwell on a timing screw '
              'needs. For a closed spring end use the wire diameter, or the coils will '
-             'pass through each other when you sweep it.')
+             'pass through each other when you sweep it.', 'ends.png')
         _tip(inputs, side + 'Flat', 'How many turns the flat run goes on for',
              'On a spring this is the dead coil that sits against the seat. On a timing '
-             'screw it is how long the container is held still for.')
+             'screw it is how long the container is held still for.', 'ends.png')
         _tip(inputs, side + 'Blend', 'How many turns it takes to ease %s the station' % into,
              'Spread over more turns it changes more gently. Too short and the coil has to '
-             'bend sharply to catch up.')
+             'bend sharply to catch up.', 'ends.png')
     _tip(inputs, 'startAngle', 'Where around the circle the helix begins',
          'Zero starts it on the X axis of the plane. It is hidden when you pick a start '
          'point, because the point decides the angle instead.')
@@ -1059,6 +1073,7 @@ def _add_station_row(table, k, turns, pitch, radius, lu):
         cell.tooltip = 'Turns from station %d to station %d' % (k - 1, k)
         cell.tooltipDescription = ('How far round the helix goes between those two '
                                    'stations. The pitch and radius blend across it.')
+        cell.toolClipFilename = _clip('turns.png')
     table.addCommandInput(cell, k, 1)
     p = tc.addValueInput('pitch%d' % k, 'Pitch', lu, pitch)
     p.tooltip = 'How far the helix climbs in one turn, at station %d' % k
@@ -1066,11 +1081,13 @@ def _add_station_row(table, k, turns, pitch, radius, lu):
         'This is a rate, measured at this one point, not a distance the helix travels. '
         'Where the pitch is changing between two stations, the run rises by the average '
         'of the two, so it usually rises less than the larger pitch.')
+    p.toolClipFilename = _clip('pitch-rise.png')
     table.addCommandInput(p, k, 2)
     r = tc.addValueInput('radius%d' % k, 'Radius', lu, radius)
     r.tooltip = 'Distance from the axis at station %d' % k
     r.tooltipDescription = ('Give two stations different radii and the helix tapers '
                             'between them, like a conical spring.')
+    r.toolClipFilename = _clip('radius.png')
     table.addCommandInput(r, k, 3)
 
 
@@ -2543,6 +2560,7 @@ def run(context):
                           'Create a helix whose pitch and radius change along its length, '
                           'for progressive springs and timing screws',
                           CreateCreated(variable=True), VAR_ICONS)
+        var_def.toolClipFilename = _clip('stations.png')
         _button(VAR_EDIT_ID, 'Edit Variable Pitch Helix',
                 'Edit a parametric variable pitch helix', EditCreated(), VAR_ICONS)
 
