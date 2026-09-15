@@ -68,12 +68,12 @@ Nothing above is a picture of a coil. Sweep a section along one and you get a bo
 
 ## Installation
 
-1. Download or clone this repository.
-2. Put its contents in a folder called `Helix3D` inside your Fusion add-ins folder:
+1. Grab the latest `Helix3D-x.y.z.zip` from [Releases](https://github.com/RonnyM82/AutodeskFusionHelix3D/releases).
+2. Extract it into your Fusion add-ins folder:
    - Windows: `%APPDATA%\Autodesk\Autodesk Fusion 360\API\AddIns`
    - Mac: `~/Library/Application Support/Autodesk/Autodesk Fusion 360/API/AddIns`
 
-   Rule number one: the folder has to be named `Helix3D`, matching `Helix3D.py` and `Helix3D.manifest`. Fusion will not see the add-in if the cloned folder keeps its repository name.
+   The zip already contains a folder called `Helix3D`, so extracting it puts everything where Fusion expects it. If you clone the repository instead, rename the folder to `Helix3D` so it matches `Helix3D.py` and `Helix3D.manifest`. Fusion will not see the add-in otherwise.
 3. In Fusion, go to **Utilities > Add-Ins**, find Helix3D on the Add-Ins tab, and run it. Tick "Run on Startup" if you want it back after a restart.
 4. The **3D Helix** command appears in the Sketch Create and Solid Create panels.
 

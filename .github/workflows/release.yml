@@ -1,0 +1,65 @@
+name: Release
+
+# Publishes a release whenever the manifest version changes on main. Bump
+# "version" in Helix3D.manifest, push, and the zip appears under Releases.
+# A manifest change that is not a version bump is ignored, because the job
+# stops when a release already exists for that version.
+
+on:
+  push:
+    branches: [main]
+    paths: [Helix3D.manifest]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read the version out of the manifest
+        id: manifest
+        run: |
+          version=$(python3 -c "import json; print(json.load(open('Helix3D.manifest'))['version'])")
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "Manifest version is $version"
+
+      - name: Check whether that version is already released
+        id: check
+        run: |
+          if gh release view "v${{ steps.manifest.outputs.version }}" >/dev/null 2>&1; then
+            echo "released=true" >> "$GITHUB_OUTPUT"
+            echo "v${{ steps.manifest.outputs.version }} is already released. Nothing to do."
+          else
+            echo "released=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Check the add-in compiles
+        if: steps.check.outputs.released == 'false'
+        run: python3 -m py_compile Helix3D.py
+
+      - name: Build the add-in zip
+        if: steps.check.outputs.released == 'false'
+        run: |
+          set -euo pipefail
+          # The top folder has to be named Helix3D, matching Helix3D.py and
+          # Helix3D.manifest, or Fusion will not load it.
+          mkdir -p dist/Helix3D
+          cp Helix3D.py Helix3D.manifest LICENSE README.md dist/Helix3D/
+          cp -r resources dist/Helix3D/resources
+          (cd dist && zip -r "../Helix3D-${{ steps.manifest.outputs.version }}.zip" Helix3D)
+          unzip -l "Helix3D-${{ steps.manifest.outputs.version }}.zip"
+
+      - name: Publish the release
+        if: steps.check.outputs.released == 'false'
+        run: |
+          gh release create "v${{ steps.manifest.outputs.version }}" \
+            "Helix3D-${{ steps.manifest.outputs.version }}.zip" \
+            --title "Helix3D ${{ steps.manifest.outputs.version }}" \
+            --generate-notes
