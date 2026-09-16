@@ -6,7 +6,7 @@
     "description": {
         "": "Parametric 3D helix, variable pitch helix and spiral sketch curves. Source and releases: https://github.com/RonnyM82/AutodeskFusionHelix3D"
     },
-    "version": "0.8.2",
+    "version": "0.9.0",
     "runOnStartup": true,
     "supportedOS": "windows|mac",
     "editEnabled": true

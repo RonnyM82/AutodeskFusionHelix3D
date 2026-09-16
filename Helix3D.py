@@ -48,6 +48,7 @@ ICONS = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'resources')
 VAR_ICONS = os.path.join(ICONS, 'variable')   # same helix, uneven coils
 TOOLCLIPS = os.path.join(ICONS, 'toolclips')  # pictures Fusion shows inside a tooltip
 MODE_ICONS = os.path.join(ICONS, 'modes')     # one small glyph per item in the Mode list
+BUTTON_ICONS = os.path.join(ICONS, 'buttons')  # Fusion will not draw a button without one
 ATTR_GROUP = 'Helix3D'
 SAMPLES_PER_TURN = 24
 PREVIEW_SAMPLES_PER_TURN = 12   # previews only have to look right; see build_curve
@@ -90,7 +91,7 @@ BLENDS = [('Smooth', 'smooth'), ('Linear', 'linear')]
 END_TYPES = [('Natural', 'natural'), ('Flat', 'flat')]   # Inventor's words for coil ends
 END_FIELDS = ('Pitch', 'Flat', 'Blend')                  # startPitch, startFlat, startBlend ...
 MAX_STATIONS = 10
-PICKERS = ('plane', 'path', 'center', 'start')   # dialog order; selection focus walks along it
+PICKERS = ('plane', 'path', 'center', 'start', 'axisLine')   # dialog order; focus walks along it
 
 
 class HelixError(Exception):
@@ -104,9 +105,10 @@ _editing_xf = None      # its sketch's transform (sketch -> model), read before 
 _editing_restore = None # TimelineObject the marker sat after when the edit dialog opened
 _editing_rolled = False
 _editing_activated = False  # activate re-fires after every pan/orbit; only the first one sets up
-_editing_deps = {}      # {'center': entity, 'start': entity} as stored when the dialog opened
+_editing_deps = {}      # {'center': entity, ...} as stored when the dialog opened
 _touched = set()        # point inputs the user changed (or cleared) in the edit dialog
 _touch_armed = False    # ignore inputChanged until the dialog has finished setting itself up
+_var_writing = False    # the dialog is changing its own inputs, so ignore what that fires
 TOUCH_EVT = 'scottHelix3DDeferredTouch'
 VAR_POLL_EVT = 'scottHelix3DVarPoll'
 _touch_pending = set()  # entity tokens of features rebuilt by compute since the last touch
@@ -235,6 +237,15 @@ def _scale(a, s):
 
 def _cross(a, b):
     return (a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0])
+
+
+def _off_axis(p, o, d):
+    """How far point p stands off the line through o along the unit vector d.
+    That distance is the radius a helix on that axis has to have to pass
+    through p."""
+    v = _sub(p, o)
+    perp = _sub(v, _scale(d, _dot(v, d)))
+    return math.sqrt(_dot(perp, perp))
 
 
 def _unit(a):
@@ -486,6 +497,79 @@ def var_helix_height(stations, smooth=True):
     return _Ramp(xs, ps, smooth).total()
 
 
+def _num_expr(v):
+    """An internal length as an expression in the document's own units. Used
+    where a value the add-in worked out has to be stored as if it were typed."""
+    um = app.activeProduct.unitsManager
+    lu = um.defaultLengthUnits
+    return '%.10f %s' % (um.convert(v, 'cm', lu), lu)
+
+
+def _len_text(v):
+    """A length written the way the document writes lengths. Falls back to
+    centimetres, which is what the internal value already is, if there is no
+    document to ask (the maths is exercised on its own by the tests)."""
+    try:
+        um = app.activeProduct.unitsManager
+        lu = um.defaultLengthUnits
+        return '%.2f %s' % (um.convert(v, 'cm', lu), lu)
+    except Exception:
+        return '%.2f cm' % v
+
+
+def _with_group_pitch(stations, group, pitch):
+    """A copy of the stations with one pitch written into every station in the
+    group. The group moves together, so a run that was flat stays flat."""
+    out = []
+    for i, st in enumerate(stations):
+        if i in group:
+            st = dict(st)
+            st['pitch'] = pitch
+        out.append(st)
+    return out
+
+
+def solve_group_pitch(stations, group, height, smooth=True):
+    """The pitch which, written into every station in the group, makes the
+    helix come out at the given height.
+
+    Pitch is rise per turn and the height is the area under the pitch, so
+    lifting the group lifts the height and there is one answer to find.
+    Bisection rather than anything cleverer: each try costs two small cubic
+    fits, the bracket is easy to establish, and sixty halvings land on the
+    answer to the last digit a length can hold.
+    """
+    if not group:
+        raise HelixError('No station is set to take up the height.')
+    at = lambda p: var_helix_height(_with_group_pitch(stations, group, p), smooth)
+
+    lo, base = 0.0, at(0.0)
+    if base > height + 1e-7:
+        raise HelixError(
+            'The other stations already make the helix %s tall, which is more than the '
+            'height you pinned it to. Give the slack station more turns, or lower the '
+            'pitch of the stations either side of it.' % _len_text(base))
+    hi = max(1.0, 2.0 * max(stations[i].get('pitch', 0.0) for i in group))
+    for _ in range(60):
+        if at(hi) >= height:
+            break
+        hi *= 2.0
+    else:
+        raise HelixError(
+            'No pitch at the slack station gets the helix to that height. It is usually '
+            'that the station has too few turns either side of it to make up the '
+            'difference.')
+    for _ in range(200):
+        if hi - lo <= max(1e-12, 1e-12 * hi):
+            break
+        mid = 0.5 * (lo + hi)
+        if at(mid) < height:
+            lo = mid
+        else:
+            hi = mid
+    return 0.5 * (lo + hi)
+
+
 def var_helix_nurbs(stations, start_ang, right_hand, smooth=True, flip=False,
                     per_turn=SAMPLES_PER_TURN, u_range=None):
     """Control points and knots for a helix around Z whose pitch and radius
@@ -582,7 +666,7 @@ def build_curve(spec, per_turn=SAMPLES_PER_TURN):
             pt.transformBy(spec['_Si'])   # path is sampled in model space
         return adsk.core.NurbsCurve3D.createNonRational(pts, 3, U, False)
     if spec['mode'] == MODE_VAR:
-        P, U = var_helix_nurbs(_expanded_stations(spec), spec['startAngle'], spec['hand'] == 'right',
+        P, U = var_helix_nurbs(_solved_stations(spec)[0], spec['startAngle'], spec['hand'] == 'right',
                                spec.get('blend', 'smooth') == 'smooth', flip, per_turn)
         return _curve_from(P, U, spec.get('xform'))
     r0, dr, height, turns = resolve(spec)
@@ -919,10 +1003,7 @@ def _read_placement(spec, inputs, sketch):
     if tri and sketch is not None:
         global _triad_last
         tri = adsk.core.TriadCommandInput.cast(tri)
-        axis = None
-        for label, key in AXIS_CHOICES:
-            if adsk.core.DropDownCommandInput.cast(_find(inputs, 'axis')).selectedItem.name == label:
-                axis = key
+        axis = _axis_choice(inputs)
         # positionTransform reports identity on current builds; transform is fine as scaling is hidden.
         # A hidden triad has been reset, so keep using the last one we saw.
         if _find(inputs, 'placement_grp').isVisible:
@@ -935,7 +1016,7 @@ def _read_placement(spec, inputs, sketch):
         center, start = _effective_point(inputs, 'center'), _effective_point(inputs, 'start')
         spec['centerToken'] = center.entityToken if center else None
         spec['startToken'] = start.entityToken if start else None
-        _place_in_sketch(spec, sketch, center, start)
+        _place_in_sketch(spec, sketch, center, start, _axis_deps(spec, _effective_axis(inputs)))
     if sketch is not None:
         path = _effective_point(inputs, 'path')
         spec['pathToken'] = path.entityToken if path else None
@@ -992,6 +1073,14 @@ def _apply_mode_tooltip(inputs):
     dd.toolClipFilename = _clip(clip)
 
 
+def _button_icon(name):
+    """Folder of glyphs for a push button. Fusion draws a button from its icon
+    and nothing else, so a missing folder means a blank button: the caller
+    falls back to a check box rather than shipping one of those."""
+    p = os.path.join(BUTTON_ICONS, name)
+    return p if os.path.isdir(p) else ''
+
+
 def _clip(name):
     """Full path to a tool clip image, or empty if it is not there. A picture
     that failed to ship must not take the dialog down with it."""
@@ -1015,16 +1104,79 @@ def _tip(inputs, cid, tip, description=None, clip=None):
 
 def _cell(inputs, cid):
     """A station table cell, found by where it sits in the table rather than by
-    name: pitch<k> and radius<k> are on row k, turns<j> (the gap after station
-    j) on row j+1. Looking a cell up by id through the table's own collection
+    name: pitch<k>, radius<k> and slack<k> are on row k, turns<j> (the gap after
+    station j) on row j+1. Looking a cell up by id through the table's own collection
     does not work once the table is inside a group."""
     table = adsk.core.TableCommandInput.cast(_find(inputs, 'table'))
     if not table:
         return None
     base = cid.rstrip('0123456789')
     k = int(cid[len(base):])
-    row, col = {'turns': (k + 1, 1), 'pitch': (k, 2), 'radius': (k, 3)}[base]
+    row, col = {'turns': (k + 1, 1), 'pitch': (k, 2), 'radius': (k, 3),
+                'slack': (k, 4)}[base]
     return table.getInputAtPosition(row, col)
+
+
+def _middle_station(n):
+    """Which station the tick starts on: the middle one, which on the table the
+    dialog opens with is the working run rather than either closed end."""
+    return max(1, (n + 1) // 2)
+
+
+def _table_height(spec, stations):
+    """What the table comes to on its own, for the Height box to start from."""
+    try:
+        return var_helix_height(_expanded_stations(dict(spec, stations=stations)),
+                                spec.get('blend', 'smooth') == 'smooth')
+    except (HelixError, KeyError, TypeError):
+        return 0.0
+
+
+def _lock_radius_on(inputs):
+    box = adsk.core.BoolValueCommandInput.cast(_find(inputs, 'lockRadius'))
+    return bool(box and box.value)
+
+
+def _pin_on(inputs):
+    box = adsk.core.BoolValueCommandInput.cast(_find(inputs, 'pinHeight'))
+    return bool(box and box.value)
+
+
+def _slack_of(inputs):
+    """The station ticked to give way to the pinned height, or 0 for none."""
+    cnt = adsk.core.IntegerSpinnerCommandInput.cast(_find(inputs, 'stations'))
+    for k in range(1, (cnt.value if cnt else 0) + 1):
+        box = adsk.core.BoolValueCommandInput.cast(_cell(inputs, 'slack%d' % k))
+        if box and box.value:
+            return k
+    return 0
+
+
+def _line_ends(ent):
+    """(start, end) in world space for a sketch line or a straight edge, else
+    None. An arc or a spline has two ends as well, but the height has to be
+    measured along something straight for the axis to mean anything."""
+    g = _path_geometry(ent) if ent is not None else None
+    line = adsk.core.Line3D.cast(g) if g is not None else None
+    return (line.startPoint, line.endPoint) if line else None
+
+
+def _axis_ends(ents):
+    """The two ends of the height from whatever was picked: a line gives both
+    on its own, otherwise it takes two points. One point is not an answer yet,
+    so it comes back None and the typed height carries on being used."""
+    ents = [e for e in ents if e is not None and e.isValid]
+    for e in ents:
+        line = _line_ends(e)
+        if line:
+            return line
+    pts = [p for p in (_point_world(e) for e in ents) if p is not None]
+    return (pts[0], pts[1]) if len(pts) >= 2 else None
+
+
+def _axis_entities(inputs):
+    sel = adsk.core.SelectionCommandInput.cast(_find(inputs, 'axisLine'))
+    return [sel.selection(i).entity for i in range(sel.selectionCount)] if sel else []
 
 
 def _blend_of(inputs):
@@ -1050,9 +1202,38 @@ def _add_var_inputs(inputs, spec=None, context='create', sketch=None):
         'All of these are optional. Leave them alone and the helix is built on the XY '
         'plane with its axis through the origin.')
     _add_pickers(pos.children, spec, context, with_path=False,
-                 start_tip='Optional. Where the helix starts: sets the start angle and the '
-                           'height it starts at. The radii come from the table.')
+                 start_tip='Optional. Where the helix starts: sets the start angle, the '
+                           'height it starts at, and the radius in row 1.')
+    # On for a new helix. Off for one made before this existed, whose row 1 was
+    # typed and must not move on its own the first time it is opened.
+    pos.children.addBoolValueInput('lockRadius', 'Lock radius to start point', True, '',
+                                   bool(spec.get('lockRadius', True)))
     _add_placement(pos.children, spec, sketch)
+
+    hgt = inputs.addGroupCommandInput('height_grp', 'Height')
+    hgt.isExpanded = True
+    hgt.tooltip = 'Make the helix finish at a height you choose'
+    hgt.tooltipDescription = (
+        'Leave this off and the height is whatever the table adds up to, which is how a '
+        'variable pitch helix normally works.<br><br>Turn it on and one station gives way '
+        'instead: you say how tall the helix is, and the pitch at that station is worked '
+        'out for you so it lands there.')
+    hc = hgt.children
+    pin = hc.addBoolValueInput('pinHeight', 'Pin the height', True, '',
+                               spec.get('heightMode', 'none') != 'none')
+    # Fusion fixes a feature's parameters when it is created, so a helix made
+    # before this existed has no height to pin and cannot be given one.
+    pin.isEnabled = context != 'edit_feature' or 'height' in (spec.get('expr') or {})
+    sel = hc.addSelectionInput('axisLine', 'Height along',
+                               'Optional. A line, or two points, to measure the height along.')
+    for flt in ('SketchLines', 'LinearEdges', 'SketchPoints', 'ConstructionPoints', 'Vertices'):
+        sel.addSelectionFilter(flt)
+    sel.setSelectionLimits(0, 2)
+    for key in ('axisA', 'axisB'):
+        ent = (spec.get('_deps') or {}).get(key)
+        if ent:
+            _pending_selections.append(('axisLine', ent))
+    hc.addValueInput('height', 'Height', lu, _seed(spec, 'height', _table_height(spec, stations)))
 
     grp = inputs.addGroupCommandInput('stations_grp', 'Stations')
     grp.isExpanded = True
@@ -1089,24 +1270,38 @@ def _add_var_inputs(inputs, spec=None, context='create', sketch=None):
         'different areas.')
     bl.toolClipFilename = _clip('blend.png')
 
-    table = ch.addTableCommandInput('table', 'Stations', 4, '1:4:3:3')
+    table = ch.addTableCommandInput('table', 'Stations', 5, '1:5:4:4:4')
     table.minimumVisibleRows = 3
     table.maximumVisibleRows = n + 1     # no blank rows reserved under the table
     table.tablePresentationStyle = adsk.core.TablePresentationStyles.itemBorderTablePresentationStyle
     tc = table.commandInputs
     for c, (hid, label) in enumerate((('h_station', 'Station'), ('h_turns', 'Turns from previous'),
-                                      ('h_pitch', 'Pitch'), ('h_radius', 'Radius'))):
+                                      ('h_pitch', 'Pitch'), ('h_radius', 'Radius'),
+                                      ('h_slack', 'Sets height'))):
         table.addCommandInput(tc.addTextBoxCommandInput(hid, '', '<b>%s</b>' % label, 1, True), 0, c)
     # turns<k> is the gap after station k, shown on the row of station k+1 so
     # that reading down each row says how far on from the one above it sits.
     gaps = [st['turns'] for st in stations if 'turns' in st] or [1.0]
+    slack = int(spec.get('slack') or 0) or _middle_station(n)
     for k in range(1, n + 1):
         st = stations[min(k - 1, len(stations) - 1)]
         _add_station_row(table, k,
                          _seed(spec, 'turns%d' % (k - 1), gaps[min(k - 2, len(gaps) - 1)]) if k >= 2 else None,
                          _seed(spec, 'pitch%d' % k, st.get('pitch', 1.0)),
-                         _seed(spec, 'radius%d' % k, st.get('radius', 2.0)), lu)
-    tb = ch.addTextBoxCommandInput('readout', '', '', 1, True)
+                         _seed(spec, 'radius%d' % k, st.get('radius', 2.0)), lu, k == slack)
+    # A button is drawn from its icon, so without one it would come out blank.
+    # A check box is the honest fallback: it looks different but it still works.
+    icon = _button_icon('copy-radius')
+    btn = ch.addBoolValueInput('copyRadius', 'Copy radius to every station',
+                               not icon, icon, False)
+    btn.tooltip = 'Give every station the radius in row 1'
+    btn.tooltipDescription = (
+        'A start point only settles the radius where the helix begins, because that is the '
+        'one place it touches. Most helices are one radius the whole way, so this copies '
+        'row 1 down the rest of the column in one go.<br><br>It copies what row 1 says, so '
+        'an expression stays an expression. Change a row afterwards and it stays changed: '
+        'this is a button, not a rule.')
+    tb = ch.addTextBoxCommandInput('readout', '', '', 2, True)
     tb.isFullWidth = True
 
     ends = inputs.addGroupCommandInput('ends_grp', 'Ends')
@@ -1146,6 +1341,9 @@ def _add_var_inputs(inputs, spec=None, context='create', sketch=None):
                                  True, '', False)
 
     _add_var_tooltips(inputs)
+    # The point may have moved since this helix was last opened, and the stored
+    # row 1 would still be reading the radius it had then.
+    _set_start_radius(inputs)
     _apply_var_visibility(inputs)
     _update_var_readout(inputs)
 
@@ -1155,16 +1353,45 @@ def _add_var_tooltips(inputs):
     the placement triad are shared with the other command, so their wording is
     set here rather than where they are built."""
     _tip(inputs, 'start', 'A point for the helix to begin at',
-         'It sets the angle the helix starts at and the height it starts from. The radius '
-         'still comes from the table, because one point cannot set a different radius at '
-         'every station.')
+         'It sets the angle the helix starts at and the height it starts from, and while '
+         'Lock radius to start point is ticked it sets the radius in row 1 as well.'
+         '<br><br>It never touches the rest of the column, so a helix that tapers between '
+         'stations keeps its taper. If the whole thing is one radius, use Copy radius to '
+         'every station under the table.')
+    _tip(inputs, 'lockRadius', 'Keep the helix running through the start point',
+         'How far the point stands off the axis is what the radius has to be where the '
+         'helix begins, or it misses the point. Ticked, row 1 is measured from the point '
+         'rather than typed, so it greys out, and it keeps up on its own: drag the point '
+         'afterwards and the helix follows it.<br><br>Unticked, the point still sets the '
+         'angle and the height but leaves the radius alone, and row 1 goes back to being '
+         'yours to type.')
     _add_shared_tooltips(inputs)
     _tip(inputs, 'table', 'One row for each station, in order along the helix',
          'Row 1 is where the helix starts, which is why its turns cell reads start rather '
          'than a number.', 'pitch.png')
     _tip(inputs, 'readout', 'The height and the total turns, worked out from the table',
          'Height is the area under the pitch curve. Multiplying the pitch by the turns only '
-         'gives the right answer where the pitch holds steady.', 'pitch-rise.png')
+         'gives the right answer where the pitch holds steady.<br><br>With the height pinned '
+         'it also tells you which stations gave way and what pitch they came out at.',
+         'pitch-rise.png')
+    _tip(inputs, 'pinHeight', 'Say how tall the helix is and let a station give way',
+         'Off, the height is whatever the table adds up to, and you find a height you want '
+         'by trying pitches until you get there.<br><br>On, you say the height and tick the '
+         'station that gives way. Its pitch is worked out for you. The other stations keep '
+         'exactly the pitch you typed, so the closed ends of a spring or the lead on a '
+         'timing screw stay put while the middle takes up the difference.')
+    _tip(inputs, 'axisLine', 'Measure the height along something in the model',
+         'Pick a sketch line or a straight edge, or pick two points. The distance between '
+         'the two ends is the height, and the helix runs along them, so it stays right when '
+         'that geometry moves.<br><br>This decides where the helix sits and which way it '
+         'points, so the plane, the centre point and the placement triad all step aside '
+         'while it is set. A start point still works: it says which way round the first '
+         'coil begins.')
+    _tip(inputs, 'height', 'How tall the helix has to come out',
+         'Used when nothing is picked above. Pick a line or two points and this shows what '
+         'they measured instead.<br><br>Every variable pitch helix carries this as a '
+         'parameter, pinned or not. Left unpinned it is only reporting what the table came '
+         'to, and changing it does nothing until you pin the height.')
     for side, label, into in (('start', 'Start', 'into'), ('end', 'End', 'out of')):
         _tip(inputs, side + 'Type', 'How the %s of the helix is finished' % label.lower(),
              'Natural begins right at the station, with nothing added.<br><br>Flat adds a '
@@ -1185,7 +1412,7 @@ def _add_var_tooltips(inputs):
          'the point on the circle it begins from.')
 
 
-def _add_station_row(table, k, turns, pitch, radius, lu):
+def _add_station_row(table, k, turns, pitch, radius, lu, slack=False):
     """Row k of the table, station k. The seeds are ValueInputs; turns is
     ignored for row 1, which is the start and has nothing before it."""
     tc = table.commandInputs
@@ -1213,15 +1440,25 @@ def _add_station_row(table, k, turns, pitch, radius, lu):
     r = tc.addValueInput('radius%d' % k, 'Radius', lu, radius)
     r.tooltip = 'Distance from the axis at station %d' % k
     r.tooltipDescription = ('Give two stations different radii and the helix tapers '
-                            'between them, like a conical spring.')
+                            'between them, like a conical spring.<br><br>Row 1 is set by '
+                            'the start point when there is one, because the radius there '
+                            'is how far that point stands off the axis.')
     r.toolClipFilename = _clip('radius.png')
     table.addCommandInput(r, k, 3)
+    s = tc.addBoolValueInput('slack%d' % k, 'Sets height', True, '', slack)
+    s.tooltip = 'Let station %d give way to the height you pinned' % k
+    s.tooltipDescription = (
+        'Tick one station and its pitch stops being something you type. It is worked out '
+        'instead, so the helix comes out at the height above.<br><br>Any station beside it '
+        'carrying the same pitch is worked out with it, to the same value, so a run of '
+        'constant pitch stays constant rather than gaining a kink in the middle.')
+    table.addCommandInput(s, k, 4)
 
 
 def _size_var_dialog(cmd):
     """The station table needs more width than Fusion gives a dialog by default."""
     try:
-        cmd.setDialogInitialSize(520, 700)
+        cmd.setDialogInitialSize(520, 780)
         cmd.setDialogMinimumSize(460, 360)
     except Exception:
         _log('Helix3D could not size the dialog:\n' + traceback.format_exc())
@@ -1301,7 +1538,7 @@ def _helix_point(spec, u):
     """The point at u turns along the helix, in sketch space. A clamped spline
     starts and ends on its outer control points, so a hair of curve either side
     of u gives the point exactly."""
-    sts = _expanded_stations(spec)
+    sts = _solved_stations(spec)[0]
     total = _station_axes(sts)[0][-1]
     eps = max(total, 1e-6) * 1e-3
     tail = u >= total - eps
@@ -1340,7 +1577,7 @@ def _label_anchor(spec):
     """Where the note sits: under the bottom of the helix, off to one side.
     It stays put whichever row is picked, so the eye does not have to chase it
     around the model."""
-    sts = _expanded_stations(spec)
+    sts = _solved_stations(spec)[0]
     xs, ps, _ = _station_axes(sts)
     rise = _Ramp(xs, ps, spec.get('blend', 'smooth') == 'smooth').total()
     if spec.get('flip'):
@@ -1357,7 +1594,7 @@ def _build_highlight(spec):
     rng = _var_focus_range(spec)
     if not rng or rng[1] - rng[0] <= 1e-9:
         return None
-    P, U = var_helix_nurbs(_expanded_stations(spec), spec['startAngle'], spec['hand'] == 'right',
+    P, U = var_helix_nurbs(_solved_stations(spec)[0], spec['startAngle'], spec['hand'] == 'right',
                            spec.get('blend', 'smooth') == 'smooth', bool(spec.get('flip')),
                            PREVIEW_SAMPLES_PER_TURN, rng)
     return _curve_from(P, U, spec.get('xform'))
@@ -1387,10 +1624,13 @@ def _focus_label(spec):
     # two places is what the rest of the dialog shows.
     length = lambda v: '%.2f %s' % (um.convert(v, 'cm', lu), lu)
     turns = lambda v: '%.2f' % v
-    st = spec['stations'][k - 1]
+    # The solved run's pitch is not the one typed in its cell, so read the note's
+    # pitch off the stations the curve was actually built from.
+    sts = _solved_stations(spec)[0]
+    o = 2 if spec.get('startType') == 'flat' else 0
+    st = sts[k - 1 + o]
     rng = _var_focus_range(spec)
     if rng:
-        sts = _expanded_stations(spec)
         xs, ps, _ = _station_axes(sts)
         ramp = _Ramp(xs, ps, spec.get('blend', 'smooth') == 'smooth')
         rise = ramp.integral(rng[1]) - ramp.integral(rng[0])
@@ -1534,36 +1774,262 @@ def _end_type(inputs, side):
     return dict(END_TYPES)[dd.selectedItem.name]
 
 
+class _Writing(object):
+    """Held while the dialog changes its own inputs. Fusion is not documented to
+    raise inputChanged for a value set from code, but a checkbox that cleared
+    another checkbox that cleared it back would hang Fusion rather than misbehave
+    visibly, and that is not a thing to find out the hard way."""
+
+    def __enter__(self):
+        global _var_writing
+        self.was = _var_writing
+        _var_writing = True
+
+    def __exit__(self, *exc):
+        global _var_writing
+        _var_writing = self.was
+        return False
+
+
+def _pick_slack(inputs, k):
+    """One station gives way, not several, so ticking one clears the rest."""
+    cnt = adsk.core.IntegerSpinnerCommandInput.cast(_find(inputs, 'stations'))
+    with _Writing():
+        for j in range(1, (cnt.value if cnt else 0) + 1):
+            box = adsk.core.BoolValueCommandInput.cast(_cell(inputs, 'slack%d' % j))
+            if box and j != k and box.value:
+                box.value = False
+
+
+def _ensure_slack(inputs):
+    """Pinning the height with nothing ticked asks a question nothing answers,
+    so tick the middle station, which is the run rather than either end."""
+    if not _pin_on(inputs) or _slack_of(inputs):
+        return
+    cnt = adsk.core.IntegerSpinnerCommandInput.cast(_find(inputs, 'stations'))
+    box = adsk.core.BoolValueCommandInput.cast(
+        _cell(inputs, 'slack%d' % _middle_station(cnt.value if cnt else 2)))
+    if box:
+        with _Writing():
+            box.value = True
+
+
+def _trim_axis(inputs):
+    """The picker takes one line or two points, and no selection filter can say
+    that, so say it here. A line wins over any points picked with it, and the
+    newest line wins over an older one, so picking a second line swaps it."""
+    sel = adsk.core.SelectionCommandInput.cast(_find(inputs, 'axisLine'))
+    if not sel or sel.selectionCount == 0:
+        return
+    ents = [sel.selection(i).entity for i in range(sel.selectionCount)]
+    lines = [e for e in ents if _line_ends(e)]
+    keep = [lines[-1]] if lines else [e for e in ents if _point_world(e) is not None][:2]
+    if len(keep) == len(ents):
+        return
+    with _Writing():
+        sel.clearSelection()
+        for e in keep:
+            sel.addSelection(e)
+
+
+def _axis_line(inputs):
+    """(a point on the helix axis, its direction), both in model space, from
+    whatever is deciding where the helix sits at the moment: a picked height
+    line, else the sketch normal or the placement triad, moved onto the centre
+    point if there is one. It is the line a start point is measured off."""
+    ends = _axis_ends(_effective_axis(inputs)) if _pin_on(inputs) else None
+    if ends:
+        a, b = ends
+        d = _unit(_sub((b.x, b.y, b.z), (a.x, a.y, a.z)))
+        return ((a.x, a.y, a.z), d) if any(d) else None
+    centre = _effective_point(inputs, 'center')
+    sk = _in_sketch()
+    if sk is not None:
+        grp, tri = _find(inputs, 'placement_grp'), _find(inputs, 'placement')
+        if centre is not None and _effective_point(inputs, 'start') is not None:
+            W = sk.transform.copy()      # both points pin it: the sketch normal
+        else:
+            T = (adsk.core.TriadCommandInput.cast(tri).transform
+                 if tri and grp and grp.isVisible else (_triad_last or sk.transform))
+            W = _axis_rotation(_axis_choice(inputs))   # local Z -> chosen triad axis
+            W.transformBy(T)
+        o, _, _, z = W.getAsCoordinateSystem()
+    else:
+        comp = adsk.fusion.Design.cast(app.activeProduct).activeComponent
+        g = _feature_placement(inputs, comp)[0].geometry
+        o, z = g.origin, g.normal
+    if centre is not None:
+        o = _point_world(centre) or o
+    return (o.x, o.y, o.z), _unit((z.x, z.y, z.z))
+
+
+def _start_radius(inputs):
+    """How far the start point stands off the axis, or None if there is no
+    start point or nothing to measure it against."""
+    try:
+        start = _effective_point(inputs, 'start')
+        p = _point_world(start) if start is not None else None
+        axis = _axis_line(inputs)
+        if p is None or axis is None:
+            return None
+        r = _off_axis((p.x, p.y, p.z), axis[0], axis[1])
+        return r if r > 1e-9 else None
+    except Exception:
+        return None       # half a placement is not an error, it is a half a placement
+
+
+def _set_start_radius(inputs):
+    """Put the start point's radius into row 1.
+
+    That is the only radius the point actually settles. The helix has to be
+    that far off the axis where it begins, or it does not pass through the
+    point at all. What it does further along is still the table's business, so
+    a helix that tapers keeps its taper. Use Copy radius to every station if
+    the whole thing is one radius, which most of them are.
+    """
+    if not _lock_radius_on(inputs):
+        return
+    r = _start_radius(inputs)
+    if r is None:
+        return
+    box = adsk.core.ValueCommandInput.cast(_cell(inputs, 'radius1'))
+    if box and abs(box.value - r) > 1e-9:
+        with _Writing():
+            box.value = r
+
+
+def _copy_radius_down(inputs):
+    """Row 1's radius into every row below it."""
+    first = adsk.core.ValueCommandInput.cast(_cell(inputs, 'radius1'))
+    cnt = adsk.core.IntegerSpinnerCommandInput.cast(_find(inputs, 'stations'))
+    if not first:
+        return
+    with _Writing():
+        for k in range(2, (cnt.value if cnt else 0) + 1):
+            box = adsk.core.ValueCommandInput.cast(_cell(inputs, 'radius%d' % k))
+            if box and box.expression != first.expression:
+                # The expression, not the value, so `wire * 3` stays `wire * 3`
+                # the whole way down instead of being flattened into a number.
+                box.expression = first.expression
+
+
 def _apply_var_visibility(inputs):
     has_start = _effective_point(inputs, 'start') is not None
     has_center = _effective_point(inputs, 'center') is not None
+    pinned = _pin_on(inputs)
+    # A line decides where the helix sits and which way it points, so everything
+    # else that was deciding that gets out of the way. The start point stays: it
+    # still says which way round the first coil begins.
+    on_line = pinned and _axis_ends(_effective_axis(inputs)) is not None
     _find(inputs, 'startAngle').isVisible = not has_start
-    _apply_placement_visibility(inputs, not (has_center and has_start))
+    lock = _find(inputs, 'lockRadius')
+    lock.isVisible = has_start        # it decides nothing without a point to follow
+    first = _cell(inputs, 'radius1')
+    if first:
+        first.isEnabled = not (has_start and _lock_radius_on(inputs))
+    _find(inputs, 'axisLine').isVisible = pinned
+    hb = adsk.core.ValueCommandInput.cast(_find(inputs, 'height'))
+    hb.isVisible = pinned
+    hb.isEnabled = not on_line
+    if on_line:
+        measured = _axis_ends(_effective_axis(inputs))
+        with _Writing():
+            hb.value = measured[0].distanceTo(measured[1])
+    for sid in ('plane', 'center'):
+        box = _find(inputs, sid)
+        if box:
+            box.isVisible = not on_line
+    _apply_placement_visibility(inputs, not on_line and not (has_center and has_start))
+    cnt = adsk.core.IntegerSpinnerCommandInput.cast(_find(inputs, 'stations'))
+    for k in range(1, (cnt.value if cnt else 0) + 1):
+        box = _cell(inputs, 'slack%d' % k)
+        if box:
+            box.isEnabled = pinned
     for side in ('start', 'end'):
         flat = _end_type(inputs, side) == 'flat'
         for f in END_FIELDS:
             _find(inputs, side + f).isVisible = flat
 
 
+READOUT_WRAP = 58      # characters that fit across the readout at the dialog's width
+
+
+def _readout_rows(text):
+    """How many rows the readout needs. A text box clips what will not fit
+    rather than growing, so the wrapping has to be counted here."""
+    rows = 0
+    for line in text.split('<br>'):
+        plain = re.sub('<[^>]+>', '', line)
+        rows += max(1, (len(plain) + READOUT_WRAP - 1) // READOUT_WRAP)
+    return min(max(rows, 1), 6)
+
+
+def _set_readout(tb, text):
+    try:
+        tb.numRows = _readout_rows(text)
+    except Exception:
+        pass        # worst case it clips, which is better than losing the message
+    tb.formattedText = text
+
+
+def _group_text(spec):
+    """Which stations gave way, as the readout says it."""
+    g = _solved_group(spec)
+    if not g:
+        return ''
+    o = 2 if spec.get('startType') == 'flat' else 0
+    lo, hi = g[0] + 1 - o, g[-1] + 1 - o
+    return 'Station %d' % lo if lo == hi else 'Stations %d to %d' % (lo, hi)
+
+
+def _show_solved_pitch(inputs, spec, pitch):
+    """Put the solved pitch in the cells it belongs to and grey them, so the
+    table shows the helix that was actually built rather than the numbers that
+    started it off. Writing a value from code raises no inputChanged, so there
+    is no loop here, and the cells are disabled so nobody is typing into one."""
+    cnt = adsk.core.IntegerSpinnerCommandInput.cast(_find(inputs, 'stations'))
+    group = set()
+    if spec is not None and pitch is not None:
+        o = 2 if spec.get('startType') == 'flat' else 0
+        group = set(i + 1 - o for i in _solved_group(spec))
+    with _Writing():
+        for k in range(1, (cnt.value if cnt else 0) + 1):
+            box = adsk.core.ValueCommandInput.cast(_cell(inputs, 'pitch%d' % k))
+            if not box:
+                continue
+            box.isEnabled = k not in group
+            if k in group and abs(box.value - pitch) > 1e-9:
+                box.value = pitch
+
+
 def _update_var_readout(inputs):
     """Height and turns fall out of the table, so show them rather than asking
-    for them. It doubles as where a bad station gets reported."""
+    for them. It doubles as where a bad station gets reported, and as where a
+    solved pitch gets written back into the table."""
     tb = adsk.core.TextBoxCommandInput.cast(_find(inputs, 'readout'))
     if not tb:
         return
     um = app.activeProduct.unitsManager
     try:
         spec = _read_var_spec(inputs)
-        sts = _expanded_stations(spec)
+        sts, pitch = _solved_stations(spec)
         height = var_helix_height(sts, spec['blend'] == 'smooth')
         turns = sum(st.get('turns', 0.0) for st in sts[:-1])
-        tb.formattedText = 'Height %s over %s turns' % (
+        _show_solved_pitch(inputs, spec, pitch)
+        text = 'Height %s over %s turns' % (
             um.formatInternalValue(height, um.defaultLengthUnits, True),
             um.formatInternalValue(turns, '', False))
+        if pitch is not None:
+            text += '.<br>%s worked out to a pitch of %s' % (_group_text(spec), _len_text(pitch))
+        elif spec.get('heightMode', 'none') != 'none':
+            text += ('.<br><b>Tick a station to give way, or the height stays '
+                     'whatever the table adds up to.</b>')
+        _set_readout(tb, text)
     except HelixError as e:
-        tb.formattedText = '<b>%s</b>' % e
+        _show_solved_pitch(inputs, None, None)
+        _set_readout(tb, '<b>%s</b>' % e)
     except Exception:
-        tb.formattedText = ''
+        _set_readout(tb, '')
 
 
 def _read_var_spec(inputs, sketch=None):
@@ -1602,8 +2068,62 @@ def _read_var_spec(inputs, sketch=None):
                 box = adsk.core.ValueCommandInput.cast(_find(inputs, side + f))
                 spec[side + f] = box.value
                 spec['expr'][side + f] = box.expression
+    spec['lockRadius'] = _lock_radius_on(inputs)
+    _read_height(spec, inputs)
     _read_placement(spec, inputs, sketch)
+    _bake_solved_pitch(spec)
     return spec
+
+
+def _read_height(spec, inputs):
+    """The Height group onto the spec. The Height box always contributes its
+    value, pinned or not, because a feature carries it as a parameter either
+    way and a parameter with nothing in it is worse than one that is only
+    telling you what the table came to."""
+    spec['slack'] = _slack_of(inputs)
+    hb = adsk.core.ValueCommandInput.cast(_find(inputs, 'height'))
+    if hb:
+        spec['height'] = hb.value
+        spec['expr']['height'] = hb.expression
+    spec['heightMode'] = 'none'
+    ents = _effective_axis(inputs) if _pin_on(inputs) else []
+    spec['axisAToken'] = ents[0].entityToken if len(ents) > 0 else None
+    spec['axisBToken'] = ents[1].entityToken if len(ents) > 1 else None
+    if not _pin_on(inputs):
+        return
+    ends = _axis_ends(ents)
+    spec['heightMode'] = 'axis' if ends else 'value'
+    if ends:
+        # The line is the height now, so it overwrites the box rather than
+        # sitting beside it. Otherwise the Height parameter keeps reporting
+        # whatever the table came to before the line was picked.
+        spec['_axisHeight'] = spec['height'] = ends[0].distanceTo(ends[1])
+        spec['expr']['height'] = _num_expr(spec['height'])
+
+
+def _bake_solved_pitch(spec):
+    """Write the solved pitch onto the spec, so that what gets stored on the
+    feature or the curve is the pitch the helix was really built from.
+
+    Solving again on the answer gives the answer back, because every station in
+    the run holds the same number and that is all the run is worked out from.
+    So this is safe to do on the way out and safe to ignore on the way back in.
+    """
+    group = _solved_group(spec)
+    if _pinned_height(spec) is None or not group:
+        return
+    pitch = _solved_stations(spec)[1]
+    if pitch is None:
+        return
+    text = _num_expr(pitch)
+    o = 2 if spec.get('startType') == 'flat' else 0
+    for i in group:
+        k = i + 1 - o
+        spec['pitch%d' % k] = pitch
+        spec['stations'][k - 1]['pitch'] = pitch
+        # The same text for every station in the run, so they come back equal
+        # and the run is still one run after a trip through the parameters.
+        spec['expr']['pitch%d' % k] = text
 
 
 def _read_any_spec(inputs, sketch=None):
@@ -1614,10 +2134,11 @@ def _read_any_spec(inputs, sketch=None):
     return _read_spec(inputs, sketch)
 
 
-def _place_in_sketch(spec, sketch, center_ent, start_ent):
+def _place_in_sketch(spec, sketch, center_ent, start_ent, axis_ents=()):
     """In-sketch placement: the triad (spec['triad'], spec['axis']) unless both
     points are set, in which case the axis is the sketch normal through the
-    centre, exactly as for a feature."""
+    centre, exactly as for a feature. A picked height line overrules both, and
+    _place is where that happens."""
     if center_ent and start_ent:
         M = adsk.core.Matrix3D.create()
     else:
@@ -1626,7 +2147,7 @@ def _place_in_sketch(spec, sketch, center_ent, start_ent):
         W = _axis_rotation(spec.get('axis', 'Z'))   # local Z -> chosen triad axis
         W.transformBy(T)                            # then the triad's own placement: W = T * R
         M = _triad_to_sketch(sketch, W)
-    _place(spec, M, _model_to_sketch(sketch.transform), center_ent, start_ent)
+    _place(spec, M, _model_to_sketch(sketch.transform), center_ent, start_ent, axis_ents)
 
 
 def _param_ids(mode, taper_by='angle'):
@@ -1649,6 +2170,16 @@ TAPER_BY = [('By angle', 'angle'), ('By end radius', 'radius')]
 AXIS_CHOICES = [('XY plane (axis = triad Z)', 'Z'),
                 ('YZ plane (axis = triad X)', 'X'),
                 ('XZ plane (axis = triad Y)', 'Y')]
+
+
+def _axis_choice(inputs):
+    """Which triad axis the Base plane dropdown is on."""
+    dd = adsk.core.DropDownCommandInput.cast(_find(inputs, 'axis'))
+    if dd and dd.selectedItem:
+        for label, key in AXIS_CHOICES:
+            if dd.selectedItem.name == label:
+                return key
+    return 'Z'
 
 
 def _axis_rotation(axis):
@@ -1683,7 +2214,11 @@ def _end_param_ids(spec):
 
 
 def _var_param_ids(spec):
-    return _station_ids(len(spec['stations'])) + _end_param_ids(spec) + ('startAngle',)
+    """Height is on the list whether or not it is pinned. Fusion settles which
+    parameters a feature owns the moment it is made and never lets that change,
+    so a helix built without it could never have its height pinned later. Left
+    unpinned it holds what the table came to, and says so in the dialog."""
+    return _station_ids(len(spec['stations'])) + _end_param_ids(spec) + ('startAngle', 'height')
 
 
 def _expanded_stations(spec):
@@ -1710,6 +2245,57 @@ def _expanded_stations(spec):
             sts[-1]['turns'] = blend
             sts += [{'turns': flat, 'pitch': p, 'radius': r}, {'pitch': p, 'radius': r}]
     return sts
+
+
+def _solved_group(spec):
+    """Which stations take up the slack, as indices into the expanded stations.
+
+    The ticked station, plus every neighbour either side of it typed at the same
+    pitch. Those neighbours are what make a run of constant pitch, and solving
+    them together is what keeps that run constant instead of putting a kink in
+    the middle of it. The flat ends are never pulled in: their pitch was typed
+    on purpose in the Ends group.
+    """
+    k = int(spec.get('slack') or 0)
+    sts = spec.get('stations') or []
+    n = len(sts)
+    if not 1 <= k <= n:
+        return []
+    same = lambda i: abs(sts[i].get('pitch', 0.0) - sts[k - 1].get('pitch', 0.0)) <= 1e-9
+    lo = hi = k
+    while lo > 1 and same(lo - 2):
+        lo -= 1
+    while hi < n and same(hi):
+        hi += 1
+    o = 2 if spec.get('startType') == 'flat' else 0   # user station j sits at j-1+o
+    return list(range(lo - 1 + o, hi + o))
+
+
+def _pinned_height(spec):
+    """The height the helix has to come out at, or None if it is not pinned.
+
+    A measured axis wins over the typed height. If the axis has gone missing the
+    typed one is used instead, because it holds the length last measured and a
+    helix that rebuilds slightly stale beats one that will not rebuild at all.
+    """
+    if spec.get('heightMode', 'none') == 'none':
+        return None
+    h = spec.get('_axisHeight') or spec.get('height')
+    return h if h and h > 1e-9 else None
+
+
+def _solved_stations(spec):
+    """(stations, solved pitch) for building geometry: the expanded stations
+    with the slack run's pitch solved to hit the pinned height. The pitch comes
+    back as None when nothing is pinned, which is every helix made before this
+    and every one left on the old behaviour."""
+    sts = _expanded_stations(spec)
+    height, group = _pinned_height(spec), _solved_group(spec)
+    if height is None or not group:
+        return sts, None
+    pitch = solve_group_pitch(sts, group, height,
+                             spec.get('blend', 'smooth') == 'smooth')
+    return _with_group_pitch(sts, group, pitch), pitch
 
 
 def _var_param_meta(pid):
@@ -1835,17 +2421,54 @@ def _point_world(entity):
     return None
 
 
+def _placed_copy(pt, Si):
+    """A world point moved into sketch space, without disturbing the original,
+    which belongs to the line it came off."""
+    q = adsk.core.Point3D.create(pt.x, pt.y, pt.z)
+    q.transformBy(Si)
+    return q
+
+
 def _model_to_sketch(sketch_xf):
     Si = sketch_xf.copy()
     Si.invert()
     return Si
 
 
-def _place(spec, M, Si, center_ent, start_ent):
+def _axis_frame(spec, M, p0, p1):
+    """Stand the helix on the picked line: local Z runs from one end to the
+    other and the origin sits on the end it starts from. Also records the
+    length, because that length is the height the helix is pinned to.
+
+    Flip runs the helix down its axis, so a flipped helix starts at the far end
+    and builds back down the line to the near one. Starting it there is all
+    this has to do; the build already knows how to go down.
+    """
+    d = _sub((p1.x, p1.y, p1.z), (p0.x, p0.y, p0.z))
+    L = math.sqrt(_dot(d, d))
+    if L <= 1e-9:
+        raise HelixError('The two ends of the height are in the same place, so there '
+                         'is no height to measure and no direction to run in.')
+    spec['_axisHeight'] = L
+    z = _scale(d, 1.0 / L)
+    # Angle zero needs somewhere square to the axis to start from. Model X,
+    # unless the axis is too near it for the cross product to be steady.
+    x = _unit(_cross((0.0, 1.0, 0.0) if abs(z[0]) > 0.9 else (1.0, 0.0, 0.0), z))
+    y = _cross(z, x)
+    o = p1 if spec.get('flip') else p0
+    M.setWithArray([x[0], y[0], z[0], o.x,
+                    x[1], y[1], z[1], o.y,
+                    x[2], y[2], z[2], o.z,
+                    0.0, 0.0, 0.0, 1.0])
+
+
+def _place(spec, M, Si, center_ent, start_ent, axis_ents=()):
     """Finish the placement. M maps helix-local space (axis = local Z) to
     sketch space; Si maps model space to sketch space. A centre point moves
     the local origin onto it; a start point sets radius, start angle and the
-    axial offset. Writes spec['xform']; mutates M."""
+    axial offset. A picked height line does the lot instead, and then a start
+    point only says which way round the first coil begins. Writes
+    spec['xform']; mutates M."""
     if spec['mode'] in PATH_MODES:   # the path places the helix; nothing else does
         spec.pop('xform', None)
         return
@@ -1854,7 +2477,11 @@ def _place(spec, M, Si, center_ent, start_ent):
         p = _point_world(ent)
         p.transformBy(Si)
         return p
-    if center_ent:
+    ends = _axis_ends(list(axis_ents)) if spec.get('heightMode') == 'axis' else None
+    if ends:
+        a, b = (_placed_copy(e, Si) for e in ends)
+        _axis_frame(spec, M, a, b)
+    elif center_ent:
         c = to_sketch(center_ent)
         M.translation = adsk.core.Vector3D.create(c.x, c.y, c.z)
     if start_ent:
@@ -1865,20 +2492,40 @@ def _place(spec, M, Si, center_ent, start_ent):
         r = math.hypot(s.x, s.y)
         if r > 1e-9:
             if spec['mode'] != MODE_VAR:
-                spec['radius'] = r   # a variable pitch helix gets its radii from the table
+                spec['radius'] = r
+            elif spec.get('lockRadius') and spec.get('stations'):
+                # Only row 1, and only when it is locked. Doing it here rather
+                # than in the dialog is what makes the helix follow the point
+                # when the point is dragged by some other command later: this
+                # runs on every rebuild, the dialog does not.
+                spec['stations'][0]['radius'] = spec['radius1'] = r
             spec['startAngle'] = math.atan2(s.y, s.x)
-        o = adsk.core.Point3D.create(0, 0, s.z)
-        o.transformBy(M)             # slide the origin along the axis to the start height
-        M.translation = adsk.core.Vector3D.create(o.x, o.y, o.z)
+        if not ends:
+            o = adsk.core.Point3D.create(0, 0, s.z)
+            o.transformBy(M)         # slide the origin along the axis to the start height
+            M.translation = adsk.core.Vector3D.create(o.x, o.y, o.z)
     if M.isEqualTo(adsk.core.Matrix3D.create()):
         spec.pop('xform', None)
     else:
         spec['xform'] = list(M.asArray())
 
 
-def _apply_points(Si, spec, center_ent, start_ent):
-    """Feature placement: axis = sketch normal through the centre point."""
-    _place(spec, adsk.core.Matrix3D.create(), Si, center_ent, start_ent)
+def _axis_deps(spec, ents):
+    """The entities the height hangs off, or nothing when the height is typed
+    or not pinned at all and there is nothing to depend on."""
+    return [e for e in ents if e is not None] if spec.get('heightMode') == 'axis' else []
+
+
+def _spec_axis_ents(spec):
+    """The two ends of the height as stored on a feature or a curve."""
+    deps = spec.get('_deps') or {}
+    return [deps.get('axisA'), deps.get('axisB')]
+
+
+def _apply_points(Si, spec, center_ent, start_ent, axis_ents=()):
+    """Feature placement: axis = sketch normal through the centre point, or the
+    picked height line when there is one."""
+    _place(spec, adsk.core.Matrix3D.create(), Si, center_ent, start_ent, axis_ents)
 
 
 def _entity_by_token(token):
@@ -1928,6 +2575,23 @@ def _mode_from_params(cf):
     return found[0] if len(found) == 1 else (None, None)
 
 
+def _height_mode_of(cf):
+    """How the height is pinned.
+
+    It is kept as a named value, but named values are written after
+    customFeatures.add and adding is what fires the first compute. That compute
+    reads the value back empty, and a helix whose height is measured off a line
+    would rebuild itself at the origin, throwing away the placement it was just
+    given. The dependency says it without being asked: axisA is only ever added
+    to a helix whose height is measured off the model. Same problem and same
+    answer as _mode_from_params.
+    """
+    stored = cf.customNamedValues.value('heightMode')
+    if stored:
+        return stored
+    return 'axis' if cf.dependencies.itemById('axisA') else 'none'
+
+
 def _spec_of_feature(cf):
     mode = cf.customNamedValues.value('mode')
     taper_by = cf.customNamedValues.value('taperBy')
@@ -1942,7 +2606,8 @@ def _spec_of_feature(cf):
             'taperBy': taper_by,
             'flip': cf.customNamedValues.value('flip') == '1',
             'expr': {},
-            '_deps': {k: _dep_entity(cf, k) for k in ('center', 'start', 'path')}}
+            '_deps': {k: _dep_entity(cf, k)
+                      for k in ('center', 'start', 'path', 'axisA', 'axisB')}}
     for i in range(cf.parameters.count):
         p = cf.parameters.item(i)
         spec[p.id] = p.value
@@ -1954,6 +2619,16 @@ def _spec_of_feature(cf):
             'flat' if 'startPitch' in ids else 'natural')
         spec['endType'] = cf.customNamedValues.value('endType') or (
             'flat' if 'endPitch' in ids else 'natural')
+        spec['heightMode'] = _height_mode_of(cf)
+        # Empty means a helix made before the lock existed, whose row 1 was
+        # typed. It also means the compute that customFeatures.add fires, which
+        # runs before any of these are written; row 1 holds the locked radius
+        # already at that point, so reading it as off builds the same curve.
+        spec['lockRadius'] = cf.customNamedValues.value('lockRadius') == '1'
+        try:
+            spec['slack'] = int(cf.customNamedValues.value('slack') or 0)
+        except ValueError:
+            spec['slack'] = 0
         n = int(cf.customNamedValues.value('stations') or 0) or sum(
             1 for i in ids if i != 'radius' and i.startswith('radius'))
         spec['stations'] = [{} for _ in range(n)]
@@ -1971,7 +2646,8 @@ def _sketch_of(cf):
 def _rebuild_feature(cf):
     sk = _sketch_of(cf)
     spec = _spec_of_feature(cf)
-    _apply_points(_model_to_sketch(sk.transform), spec, spec['_deps']['center'], spec['_deps']['start'])
+    _apply_points(_model_to_sketch(sk.transform), spec, spec['_deps']['center'],
+                  spec['_deps']['start'], _spec_axis_ents(spec))
     _attach_path(spec, sk.transform, spec['_deps']['path'])
     fs = sk.sketchCurves.sketchFixedSplines.item(0)
     return fs.replaceGeometry(build_curve(spec))
@@ -2049,7 +2725,11 @@ def _spec_of_curve(curve):
     if not a:
         return None
     spec = json.loads(a.value)
-    spec['_deps'] = {k: _entity_by_token(spec.get(k + 'Token')) for k in ('center', 'start', 'path')}
+    spec['_deps'] = {k: _entity_by_token(spec.get(k + 'Token'))
+                     for k in ('center', 'start', 'path', 'axisA', 'axisB')}
+    # A curve drawn before the lock existed had its row 1 typed, so leave it
+    # typed rather than moving it the first time the dialog is opened.
+    spec.setdefault('lockRadius', False)
     return spec
 
 
@@ -2091,7 +2771,8 @@ def _evaluate_spec(spec, sketch):
         _stations_from_values(spec)
     if spec.get('triad'):
         _place_in_sketch(spec, sketch, _entity_by_token(spec.get('centerToken')),
-                         _entity_by_token(spec.get('startToken')))
+                         _entity_by_token(spec.get('startToken')),
+                         [_entity_by_token(spec.get(k)) for k in ('axisAToken', 'axisBToken')])
     _attach_path(spec, sketch.transform, _entity_by_token(spec.get('pathToken')))
 
 
@@ -2118,6 +2799,10 @@ def _refresh_sketch_helices():
             continue   # its path is gone; leave the curve as it is
         if _curve_differs(curve.geometry, new):
             curve.replaceGeometry(new)
+            try:
+                _bake_solved_pitch(spec)   # the line may have changed length
+            except HelixError:
+                pass
             attr.value = json.dumps(_storable(spec))
 
 
@@ -2206,15 +2891,18 @@ class InputChanged(adsk.core.InputChangedEventHandler):
             # for a table cell is the table's own. Always work from the top level.
             inputs = adsk.core.Command.cast(args.firingEvent.sender).commandInputs
             cid = args.input.id
-            if _touch_armed and cid in ('center', 'start', 'path'):
+            if _touch_armed and cid in ('center', 'start', 'path', 'axisLine'):
                 _touched.add(cid)
             if cid == 'center':
                 _triad_follow_center(inputs)
             if _find(inputs, 'stations'):      # the variable pitch dialog
                 global _var_focus, _var_last_row
+                if _var_writing:
+                    return      # the dialog is rewriting its own cells
                 base = cid.rstrip('0123456789')
                 if cid == 'stations':
                     _rebuild_station_table(inputs)
+                    _ensure_slack(inputs)
                     _var_focus = None
                 elif cid == 'table':                # a row was clicked
                     row = adsk.core.TableCommandInput.cast(args.input).selectedRow
@@ -2226,6 +2914,24 @@ class InputChanged(adsk.core.InputChangedEventHandler):
                 elif base != cid and base == 'turns':   # turns<j> sits on row j+1
                     _var_focus = ('row', int(cid[len(base):]) + 1)
                     _var_last_row = _selected_row(inputs)
+                elif base != cid and base == 'slack':
+                    k = int(cid[len(base):])
+                    _pick_slack(inputs, k)
+                    _var_focus, _var_last_row = ('row', k), _selected_row(inputs)
+                elif cid == 'copyRadius':
+                    _copy_radius_down(inputs)
+                    with _Writing():
+                        adsk.core.BoolValueCommandInput.cast(args.input).value = False
+                elif cid == 'pinHeight':
+                    _ensure_slack(inputs)
+                    _set_start_radius(inputs)   # a different axis to measure from
+                elif cid == 'axisLine':
+                    _trim_axis(inputs)
+                    _set_start_radius(inputs)   # the axis moved
+                elif cid in ('start', 'center', 'plane', 'placement', 'axis', 'lockRadius'):
+                    # Any of these changes where the start point stands relative
+                    # to the axis, which is what the locked radius is measuring.
+                    _set_start_radius(inputs)
                 elif cid.startswith('start') and cid != 'startAngle':
                     # An Ends field was changed: show that end rather than
                     # whichever table row happened to be picked last. Keeping
@@ -2326,20 +3032,23 @@ def _wire(cmd, execute_handler, activate=None, destroy=None, preview=None):
 # Create command
 # --------------------------------------------------------------------------
 def _create_sketch(comp, plane, spec, center_ent=None, start_ent=None, path_ent=None,
-                   per_turn=SAMPLES_PER_TURN):
+                   per_turn=SAMPLES_PER_TURN, axis_ents=()):
     sk = comp.sketches.add(plane)
     sk.name = 'Variable Helix' if spec['mode'] == MODE_VAR else 'Helix'
-    _apply_points(_model_to_sketch(sk.transform), spec, center_ent, start_ent)
+    _apply_points(_model_to_sketch(sk.transform), spec, center_ent, start_ent, axis_ents)
     _attach_path(spec, sk.transform, path_ent)
     sk.sketchCurves.sketchFixedSplines.addByNurbsCurve(build_curve(spec, per_turn))
     return sk
 
 
-def _create_feature(comp, plane, spec, center_ent=None, start_ent=None, path_ent=None):
+def _create_feature(comp, plane, spec, center_ent=None, start_ent=None, path_ent=None,
+                    axis_ents=()):
     global _creating
     units = _units()
     var = spec['mode'] == MODE_VAR
-    sk = _create_sketch(comp, plane, spec, center_ent, start_ent, path_ent)
+    axis_ents = _axis_deps(spec, axis_ents)
+    sk = _create_sketch(comp, plane, spec, center_ent, start_ent, path_ent,
+                        SAMPLES_PER_TURN, axis_ents)
 
     cfi = comp.features.customFeatures.createInput(_def_var if var else _def)
     pids = _var_param_ids(spec) if var else _param_ids(spec['mode'], spec.get('taperBy', 'angle'))
@@ -2354,6 +3063,9 @@ def _create_feature(comp, plane, spec, center_ent=None, start_ent=None, path_ent
         cfi.addDependency('start', start_ent)
     if path_ent:
         cfi.addDependency('path', path_ent)
+    for name, ent in zip(('axisA', 'axisB'), list(axis_ents) + [None, None]):
+        if ent is not None:
+            cfi.addDependency(name, ent)
     cfi.setStartAndEndFeatures(sk, sk)
     _create_computes.clear()
     _creating = True
@@ -2369,6 +3081,9 @@ def _create_feature(comp, plane, spec, center_ent=None, start_ent=None, path_ent
         cf.customNamedValues.addOrSetValue('stations', str(len(spec['stations'])))
         cf.customNamedValues.addOrSetValue('startType', spec.get('startType', 'natural'))
         cf.customNamedValues.addOrSetValue('endType', spec.get('endType', 'natural'))
+        cf.customNamedValues.addOrSetValue('heightMode', spec.get('heightMode', 'none'))
+        cf.customNamedValues.addOrSetValue('slack', str(spec.get('slack') or 0))
+        cf.customNamedValues.addOrSetValue('lockRadius', '1' if spec.get('lockRadius') else '0')
     else:
         cf.customNamedValues.addOrSetValue('taperBy', spec.get('taperBy', 'angle'))
     # A feature created a moment ago can have nothing built on it, so the touch
@@ -2413,11 +3128,13 @@ class CreateExecute(adsk.core.CommandEventHandler):
                     return
                 # A feature can't carry the triad; it is placed by the plane, points and path only.
                 _create_feature(sk.parentComponent, sk.referencePlane, spec,
-                                _picked(inputs, 'center'), _picked(inputs, 'start'), _picked(inputs, 'path'))
+                                _picked(inputs, 'center'), _picked(inputs, 'start'),
+                                _picked(inputs, 'path'), _effective_axis(inputs))
                 return
             comp = des.activeComponent
             plane, center_ent, start_ent, path_ent = _feature_placement(inputs, comp)
-            _create_feature(comp, plane, spec, center_ent, start_ent, path_ent)
+            _create_feature(comp, plane, spec, center_ent, start_ent, path_ent,
+                            _effective_axis(inputs))
         except HelixError as e:
             ui.messageBox(str(e), 'Helix3D')
         except Exception:
@@ -2441,7 +3158,8 @@ class CreatePreview(adsk.core.CommandEventHandler):
             comp = adsk.fusion.Design.cast(app.activeProduct).activeComponent
             plane, center_ent, start_ent, path_ent = _feature_placement(inputs, comp)
             psk = _create_sketch(comp, plane, spec, center_ent, start_ent, path_ent,
-                                 PREVIEW_SAMPLES_PER_TURN)
+                                 PREVIEW_SAMPLES_PER_TURN,
+                                 _axis_deps(spec, _effective_axis(inputs)))
             _show_highlight(spec, comp, psk.transform)
         except HelixError:
             pass   # nothing to preview yet (no path picked)
@@ -2514,6 +3232,9 @@ class EditExecute(adsk.core.CommandEventHandler):
             # Grab the picks before the timeline moves; the inputs may not hold
             # them once their geometry is rolled away.
             picks = {sid: _effective_point(inputs, sid) for sid in ('center', 'start', 'path')}
+            axis = _axis_deps(spec, _effective_axis(inputs))
+            picks['axisA'] = axis[0] if len(axis) > 0 else None
+            picks['axisB'] = axis[1] if len(axis) > 1 else None
             _log('Helix3D edit: picks ' + ', '.join('%s=%s' % (k, _describe(v)) for k, v in picks.items())
                  + '; touched=%s' % sorted(_touched))
             # Dependencies can only change while the marker sits just before the
@@ -2523,7 +3244,9 @@ class EditExecute(adsk.core.CommandEventHandler):
             if not _roll_back_for_edit(cf):
                 _log('Helix3D edit: marker %d, feature index %d after roll back'
                         % (tl.markerPosition, cf.timelineObject.index))
-            for sid, label in (('center', 'Center Point'), ('start', 'Start Point'), ('path', 'Path')):
+            for sid, label in (('center', 'Center Point'), ('start', 'Start Point'),
+                               ('path', 'Path'), ('axisA', 'Height along'),
+                               ('axisB', 'Height along')):
                 new_ent = picks[sid]
                 dep = cf.dependencies.itemById(sid)
                 if new_ent is None:
@@ -2550,6 +3273,10 @@ class EditExecute(adsk.core.CommandEventHandler):
             cf.customNamedValues.addOrSetValue('flip', '1' if spec.get('flip') else '0')
             if spec['mode'] == MODE_VAR:
                 cf.customNamedValues.addOrSetValue('blend', spec['blend'])
+                cf.customNamedValues.addOrSetValue('heightMode', spec.get('heightMode', 'none'))
+                cf.customNamedValues.addOrSetValue('slack', str(spec.get('slack') or 0))
+                cf.customNamedValues.addOrSetValue('lockRadius',
+                                                  '1' if spec.get('lockRadius') else '0')
             for i in range(cf.parameters.count):
                 p = cf.parameters.item(i)
                 p.expression = spec['expr'][p.id]
@@ -2581,6 +3308,16 @@ def _effective_point(inputs, sid):
     return ent
 
 
+def _effective_axis(inputs):
+    """The same idea for the height line, which is two entities rather than
+    one: what is in the picker, or what the feature already stores if the
+    picker has not been touched."""
+    ents = [e for e in _axis_entities(inputs) if e is not None]
+    if not ents and 'axisLine' not in _touched:
+        ents = [_editing_deps.get(k) for k in ('axisA', 'axisB')]
+    return [e for e in ents if e is not None]
+
+
 class EditPreview(adsk.core.CommandEventHandler):
     """Hide the feature's own sketch and draw the would-be curve as custom
     graphics. Both live in the preview transaction, so they are redone on
@@ -2590,7 +3327,8 @@ class EditPreview(adsk.core.CommandEventHandler):
             inputs = adsk.core.CommandEventArgs.cast(args).command.commandInputs
             spec = _read_any_spec(inputs)
             center, start = _effective_point(inputs, 'center'), _effective_point(inputs, 'start')
-            _apply_points(_model_to_sketch(_editing_xf), spec, center, start)
+            _apply_points(_model_to_sketch(_editing_xf), spec, center, start,
+                          _effective_axis(inputs))
             _attach_path(spec, _editing_xf, _effective_point(inputs, 'path'))
             r = spec.get('radius')
             if r is None and spec.get('stations'):
