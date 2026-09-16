@@ -4,9 +4,10 @@ Run it from anywhere:
 
     python tools/make_icons.py
 
-It writes resources/variable/16x16.png, 32x32.png and 64x64.png. It never
-touches resources/*.png, the constant pitch icon, which was drawn by hand and
-is the reference this one is matched to.
+It writes resources/variable/16x16.png, 32x32.png and 64x64.png, and beside
+each one an @2x twin at double the pixels. It also fills in the @2x files the
+hand drawn constant pitch icon in resources/ needs, without touching the three
+hand drawn originals; see constant_hidpi for how.
 
 Add --compare to also write a side by side strip of both icons at 4x on a
 Fusion dark background, so you can check the pair still look related after a
@@ -30,6 +31,15 @@ are deliberately restyling both icons.
 The two colours are the depth cue the original uses. Each coil is drawn twice:
 the half going round the back in a muted blue grey, then the half facing you in
 the bright blue painted over the top.
+
+Why every icon is written twice
+-------------------------------
+Fusion is Qt underneath, and when the screen puts two real pixels where the
+interface asked for one, as a Retina Mac or a 4K laptop does, Qt looks first
+for the same file name with @2x on the end. If it is not there it stretches the
+ordinary file up instead, and that is what makes the ribbon look grainy. So
+32x32.png is the drawing at 32 pixels and 32x32@2x.png is the same drawing at
+64. Same picture, same apparent size on screen, twice the pixels.
 """
 import argparse
 import math
@@ -55,8 +65,11 @@ FITTED = {
 }
 
 # Thinner line at the small sizes, or the tight coils at the bottom merge.
+# Keyed on the size the icon appears at, not on how many pixels it is drawn
+# with, so an @2x file keeps the line weight of the size it stands in for.
 STROKE_SCALE = {64: 1.00, 32: 0.95, 16: 0.80}
-SUPERSAMPLE = {64: 10, 32: 12, 16: 16}
+# Keyed on pixels actually drawn. Bigger canvases need less oversampling.
+SUPERSAMPLE = {128: 8, 64: 10, 32: 12, 16: 16}
 
 # Four coils, tight at the bottom and opening out towards the top. Pitch here
 # is relative: the whole profile is scaled to the climb above, so only the
@@ -65,6 +78,24 @@ PROFILE = [{'turns': 1.0, 'pitch': 0.30, 'radius': 1.0},
            {'turns': 1.0, 'pitch': 0.62, 'radius': 1.0},
            {'turns': 1.0, 'pitch': 1.18, 'radius': 1.0},
            {'pitch': 1.90, 'radius': 1.0}]
+
+# The constant pitch icon, the one drawn by hand, fitted the same way and for
+# the same reason: there is no drawing file behind it, so the only way to get a
+# 128 pixel version of it was to find the helix that draws it. Same coordinate
+# descent on mean alpha difference against resources/64x64.png, which it lands
+# within about five per cent of. Even pitch, so the profile is one long run.
+CONST_FITTED = {
+    'cx': 31.9274,
+    'cy': 53.5,
+    'radius': 19.9602,
+    'squash': 0.3341,
+    'climb': 43.2929,
+    'start': 0.7324,
+    'stroke': 3.9626,
+    'turns': 2.816,
+}
+CONST_PROFILE = [{'turns': CONST_FITTED['turns'], 'pitch': 1.0, 'radius': 1.0},
+                 {'pitch': 1.0, 'radius': 1.0}]
 
 NEAR = (0x5A, 0xAA, 0xFF)   # the half of the coil facing you
 FAR = (0x96, 0xAE, 0xC8)    # the half going round the back
@@ -171,9 +202,12 @@ def coverage(size, pts, stroke, ss):
             if dy * dy > r2:
                 continue
             half = math.sqrt(r2 - dy * dy)
-            row = grid[yy]
-            for xx in range(max(int(cx - half), 0), min(int(cx + half) + 1, W)):
-                row[xx] = 1
+            x0 = max(int(cx - half), 0)
+            x1 = min(int(cx + half) + 1, W)
+            if x1 > x0:
+                # One slice, not a Python loop per pixel. Same result, and it
+                # is what keeps the 128 pixel icons down to seconds.
+                grid[yy][x0:x1] = b'\x01' * (x1 - x0)
     n = float(ss * ss)
     return [[sum(sum(grid[yy][x * ss:x * ss + ss])
                  for yy in range(y * ss, y * ss + ss)) / n
@@ -222,11 +256,11 @@ def split_depth(samples):
     return far, near
 
 
-def sample(H, profile, size, stroke):
+def sample(H, profile, size, stroke, fit=FITTED):
     """Project the helix into the canvas and say which half each point is on."""
     s = size / 64.0
-    cx, cy = FITTED['cx'] * s, FITTED['cy'] * s
-    R, climb = FITTED['radius'] * s, FITTED['climb'] * s
+    cx, cy = fit['cx'] * s, fit['cy'] * s
+    R, climb = fit['radius'] * s, fit['climb'] * s
     xs, ps, rs = H._station_axes(profile)
     pitch, radius = H._Ramp(xs, ps, True), H._Ramp(xs, rs, True)
     k, total = climb / pitch.total(), xs[-1]
@@ -234,20 +268,22 @@ def sample(H, profile, size, stroke):
     pts = []
     for i in range(steps + 1):
         u = total * i / steps
-        a = FITTED['start'] + 2 * math.pi * u
+        a = fit['start'] + 2 * math.pi * u
         rr = radius.value(u) * R
-        y = cy - (pitch.integral(u) * k + FITTED['squash'] * rr * math.sin(a))
+        y = cy - (pitch.integral(u) * k + fit['squash'] * rr * math.sin(a))
         pts.append(((cx + rr * math.cos(a), y), math.sin(a) > 0.0))
     ys = [p[1] for p, _ in pts]
     shift = (size - (max(ys) - min(ys) + stroke)) / 2.0 - (min(ys) - stroke / 2)
     return [((x, y + shift), f) for (x, y), f in pts]
 
 
-def build(H, profile, size):
-    stroke = FITTED['stroke'] * (size / 64.0) * STROKE_SCALE[size]
-    far, near = split_depth(sample(H, profile, size, stroke))
+def build(H, profile, size, scale=1, fit=FITTED, ss=None):
+    """Draw the icon for `size`, using `scale` pixels per pixel of it."""
+    px = size * scale
+    stroke = fit['stroke'] * (px / 64.0) * fit.get('thin', STROKE_SCALE)[size]
+    far, near = split_depth(sample(H, profile, px, stroke, fit))
     layers = [(seg, FAR) for seg in far] + [(seg, NEAR) for seg in near]
-    return paint(size, layers, stroke, SUPERSAMPLE[size])
+    return paint(px, layers, stroke, ss or SUPERSAMPLE[px])
 
 
 def compare_strip(path, scale=4, pad=12):
@@ -279,6 +315,37 @@ def compare_strip(path, scale=4, pad=12):
     write_png(path, W, Hh, rows)
 
 
+def constant_hidpi(H):
+    """Give the hand drawn constant pitch icon its @2x files.
+
+    Two of the three are free. An @2x file is the same picture with twice the
+    pixels, and the next hand drawn file up is already exactly that: 64x64.png
+    is a 64 pixel drawing of the icon, which is precisely what 32x32@2x.png has
+    to be. Those are copied across byte for byte rather than resampled, so the
+    ribbon on a Retina Mac shows the drawing itself and not a stretched one.
+
+    The third has nothing above it to copy, so 64x64@2x.png is drawn from
+    CONST_FITTED instead, the helix found by fitting to the hand drawn 64x64.
+    It is the only generated file in the constant pitch set. The three hand
+    drawn originals are left exactly as they are.
+    """
+    done = []
+    for src, dst in (('32x32.png', '16x16@2x.png'), ('64x64.png', '32x32@2x.png')):
+        s_path = os.path.join(ROOT, 'resources', src)
+        d_path = os.path.join(ROOT, 'resources', dst)
+        with open(s_path, 'rb') as f:
+            data = f.read()
+        if not (os.path.exists(d_path) and open(d_path, 'rb').read() == data):
+            with open(d_path, 'wb') as f:
+                f.write(data)
+        done.append('resources/%s, copied from %s' % (dst, src))
+
+    out = os.path.join(ROOT, 'resources', '64x64@2x.png')
+    write_png(out, 128, 128, build(H, CONST_PROFILE, 64, 2, CONST_FITTED))
+    done.append('resources/64x64@2x.png, drawn at 128')
+    return done
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument('--compare', action='store_true',
@@ -287,9 +354,15 @@ def main():
 
     H = load_addin()
     for size in (64, 32, 16):
-        out = os.path.join(ROOT, 'resources', 'variable', '%dx%d.png' % (size, size))
-        write_png(out, size, size, build(H, PROFILE, size))
-        print('wrote %s' % os.path.relpath(out, ROOT))
+        for scale in (1, 2):
+            px = size * scale
+            name = '%dx%d%s.png' % (size, size, '@2x' if scale == 2 else '')
+            out = os.path.join(ROOT, 'resources', 'variable', name)
+            write_png(out, px, px, build(H, PROFILE, size, scale))
+            print('wrote %s' % os.path.relpath(out, ROOT))
+
+    for name in constant_hidpi(H):
+        print('wrote %s' % name)
 
     if args.compare:
         strip = os.path.join(tempfile.gettempdir(), 'helix3d-icon-compare.png')

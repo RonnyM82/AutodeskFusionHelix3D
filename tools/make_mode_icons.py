@@ -4,9 +4,13 @@ Run it from anywhere:
 
     python tools/make_mode_icons.py
 
-It writes resources/modes/<mode>/16x16.png, 32x32.png and 64x64.png. Fusion
-only shows these when the dropdown uses LabeledIconDropDownStyle; with the
-plain text style the icon argument is accepted and then ignored.
+It writes resources/modes/<mode>/16x16.png, 32x32.png and 64x64.png, and an
+@2x twin of each: the same glyph at twice the pixels, which is what Fusion
+reaches for on a Retina Mac or any other screen drawing two device pixels per
+interface pixel. Without it the dropdown gets a stretched 16 pixel image and
+looks grainy. Fusion only shows these at all when the dropdown uses
+LabeledIconDropDownStyle; with the plain text style the icon argument is
+accepted and then ignored.
 
 The glyphs say what shape the mode makes and which two numbers you type for
 it. Three of the six make the same straight helix and differ only by the
@@ -15,7 +19,9 @@ as six separate things. That is the honest answer: the modes differ in what
 you hand Fusion, not in what comes out.
 
 Drawn at eight times size and filtered down, on a transparent ground in the
-same blue as the command icons so they sit on the dark dropdown.
+same blue as the command icons so they sit on the dark dropdown. The @2x files
+come off the same oversampled drawing, filtered down half as far, so the line
+weights match the size they stand in for rather than the size of the file.
 """
 import math
 import os
@@ -102,7 +108,8 @@ def curved_coil(d, box, turns, r, w, squash=0.45):
 # --------------------------------------------------------------------------
 # One function per mode, all working in a 0..1 box scaled to the icon size
 # --------------------------------------------------------------------------
-def glyph(name, px):
+def glyph(name, px, scale=1):
+    """The glyph as it looks at `px`, written with `scale` pixels per pixel."""
     img, d = canvas(px)
     S = float(px)
     w = max(0.85, S * 0.055)             # stroke, in final pixels
@@ -128,7 +135,7 @@ def glyph(name, px):
         if name in ('revolutions-height', 'height-pitch'):
             bar(d, S * 0.90, S * 0.11, S * 0.89, half)
 
-    return img.resize((px, px), Image.LANCZOS)
+    return img.resize((px * scale, px * scale), Image.LANCZOS)
 
 
 MODES = ('revolutions-pitch', 'revolutions-height', 'height-pitch',
@@ -139,5 +146,7 @@ if __name__ == '__main__':
         folder = os.path.join(OUTDIR, name)
         os.makedirs(folder, exist_ok=True)
         for px in SIZES:
-            glyph(name, px).save(os.path.join(folder, '%dx%d.png' % (px, px)), optimize=True)
+            for scale in (1, 2):
+                out = '%dx%d%s.png' % (px, px, '@2x' if scale == 2 else '')
+                glyph(name, px, scale).save(os.path.join(folder, out), optimize=True)
         print('wrote %s' % os.path.relpath(folder, ROOT))

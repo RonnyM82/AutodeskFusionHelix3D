@@ -14,6 +14,13 @@ the picture only has to show the shape of the thing. Each is 300 x 200, which
 is the size Fusion's own tool clips use, drawn at four times that and filtered
 down so the curves and the small type stay clean.
 
+Each one is written twice, as <name>.png at 300 x 200 and <name>@2x.png at
+600 x 400. On a screen that puts two device pixels where the interface asked
+for one, a Retina Mac or a 4K laptop, Fusion goes looking for the @2x name
+first and stretches the small file up if it is missing, which is what makes a
+tooltip picture look soft. Both come off the same oversampled drawing, so the
+type and the line weights are identical, only sharper.
+
 The helix curves come from the add-in's own solver, the same as the command
 icon does, so a picture of a helix here is a real one.
 """
@@ -100,9 +107,11 @@ def dot(d, p, r, fill, outline=None, ow=1.2):
 
 def save(img, name):
     os.makedirs(OUTDIR, exist_ok=True)
-    out = os.path.join(OUTDIR, name)
-    img.resize((W, HT), Image.LANCZOS).save(out, optimize=True)
-    print('wrote %s' % os.path.relpath(out, ROOT))
+    for scale in (1, 2):
+        stem = name[:-4] if name.lower().endswith('.png') else name
+        out = os.path.join(OUTDIR, '%s%s.png' % (stem, '@2x' if scale == 2 else ''))
+        img.resize((W * scale, HT * scale), Image.LANCZOS).save(out, optimize=True)
+        print('wrote %s' % os.path.relpath(out, ROOT))
 
 
 # --------------------------------------------------------------------------
