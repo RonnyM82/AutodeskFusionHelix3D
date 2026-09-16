@@ -96,6 +96,18 @@ Nothing above is a picture of a coil. Sweep a section along one and you get a bo
 
 IMPORTANT: if you change the manifest, restart Fusion completely. Fusion only reads it at startup, and a half-loaded add-in fails in ways that look like a bug in the command.
 
+## Updates
+
+You only have to do that once. After it is installed, Helix3D asks GitHub about once a day whether there is a newer release. When there is, it downloads it quietly and waits. The next time you finish with a helix command it asks whether you want it, and you can install it, put it off, or skip that version for good. Nothing is replaced unless you say yes, and nothing interrupts you mid-command.
+
+Once it has swapped the files over, restart Fusion. Fusion only reads the manifest at startup, so until you do you are still running the old version. Your settings and your log are left alone, and the version it replaced is kept in `.helix3d-backup` next to the add-in if you ever want to put it back by hand.
+
+Two things it will not do. It refuses to update a copy running out of a clone of this repository, so a working tree never gets overwritten. And if it cannot verify a certificate, it does nothing at all rather than trusting whatever answered.
+
+Worth being straight about what that verification is worth. The download comes over HTTPS from GitHub, and it is refused unless the byte count matches what the GitHub API reported, the Python compiles, and the manifest inside carries this add-in's own id and the same version as the release tag. That shows it arrived intact from GitHub. It does not show the code is safe: anyone who got push access to this repository could publish Python that runs with your Fusion privileges. Signed releases would fix that properly, and this does not do it.
+
+If you would rather it never looked, set `"enabled": false` under `update` in `Helix3D.settings.json` next to the add-in.
+
 ## Using it
 
 The command behaves differently depending on whether you are in a sketch when you start it, so pick the one that suits what you are doing.

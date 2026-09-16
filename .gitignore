@@ -3,3 +3,5 @@ Helix3D.log
 Helix3D.settings.json
 __pycache__/
 *.pyc
+.helix3d-update/
+.helix3d-backup/

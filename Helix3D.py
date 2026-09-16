@@ -23,8 +23,14 @@ import adsk.fusion
 import json
 import math
 import os
+import re
+import shutil
+import stat
+import sys
 import threading
+import time
 import traceback
+import zipfile
 
 app = adsk.core.Application.get()
 ui = app.userInterface
@@ -108,6 +114,10 @@ def _save_settings():
 
 
 _settings = _load_settings()
+
+
+def _addin_dir():
+    return os.path.dirname(os.path.abspath(__file__))
 
 
 def _log(msg):
@@ -2561,6 +2571,10 @@ class CommandTerminated(adsk.core.ApplicationCommandEventHandler):
     def notify(self, args):
         try:
             cid = adsk.core.ApplicationCommandEventArgs.cast(args).commandId
+            if cid in OUR_COMMANDS:
+                # The user has just used the add-in, so the interface is up and
+                # they are between jobs. That is when an update gets mentioned.
+                _request_drain()
             if cid in OUR_COMMANDS or cid == 'SelectCommand':
                 return
             # Pan/orbit terminate too; don't touch the model under one of our dialogs.
@@ -2584,6 +2598,1031 @@ class MarkingMenu(adsk.core.MarkingMenuEventHandler):
                 menu.addCommand(ui.commandDefinitions.itemById(SKETCH_EDIT_ID))
         except Exception:
             _log('Helix3D marking menu failed:\n' + traceback.format_exc())
+
+
+# --------------------------------------------------------------------------
+# Updates: check GitHub for a new release, and install it when asked to
+# --------------------------------------------------------------------------
+GH_OWNER = 'RonnyM82'
+GH_REPO = 'AutodeskFusionHelix3D'
+GH_HOME = 'https://github.com/%s/%s' % (GH_OWNER, GH_REPO)
+GH_LATEST = 'https://api.github.com/repos/%s/%s/releases/latest' % (GH_OWNER, GH_REPO)
+GH_RELEASES = GH_HOME + '/releases'
+ADDIN_ID = 'e38cea06-648e-4a3d-aac2-e6085495807c'
+UPDATE_EVT = 'scottHelix3DUpdate'
+
+API_TIMEOUT = 10        # per socket operation, not a total budget
+DL_TIMEOUT = 60
+API_DEADLINE = 30       # wall clock, because a slow drip never trips a socket timeout
+DL_DEADLINE = 180
+MIN_ZIP, MAX_ZIP = 10_000, 20_000_000
+MAX_ENTRIES, MAX_UNPACKED = 200, 50_000_000
+CHECK_INTERVAL = 24 * 3600
+BACKOFF = (86400, 3 * 86400, 7 * 86400)   # by consecutive failure count
+CLOCK_SANITY = 30 * 86400
+OK_HOSTS = ('github.com', 'githubusercontent.com')
+
+_update_ready = None    # (version, staged folder) waiting to be offered
+_update_asked = False   # the question has been put once this session
+_pending_confirmed = ['']   # a version installed earlier that a restart made live
+_update_stop = None     # threading.Event that abandons an in-flight check
+_update_gen = 0         # bumped in stop(), so a late event from an old load is ignored
+_ssl_ctx = False        # False = not probed yet, None = probed, no trust anchors
+_log_lock = threading.Lock()
+
+
+class _UpdateError(Exception):
+    """A failure worth reporting. `reason` is one line fit for a dialog;
+    str(self) is the longer version that goes in the log."""
+    def __init__(self, reason, detail=''):
+        super().__init__(reason + ((': ' + detail) if detail else ''))
+        self.reason = reason
+
+
+def _ulog(msg):
+    """Log from a background thread. File only: _log() calls app.log(), and
+    Fusion's API is main-thread only."""
+    try:
+        with _log_lock:
+            with open(LOG_FILE, 'a', encoding='utf-8') as f:
+                f.write(msg + '\n')
+    except OSError:
+        pass
+
+
+# --------------------------------------------------------------------------
+# Versions
+# --------------------------------------------------------------------------
+def _parse_version(text):
+    """'v0.8.0' -> (0, 8, 0, 0, 1). Anything unreadable -> None.
+
+    Four numeric slots and a release flag. The flag is 0 when something
+    followed the numbers, so 0.9.0-rc1 sorts below 0.9.0 without having to
+    understand pre-release identifiers."""
+    if not isinstance(text, str):
+        return None
+    s = text.strip().lstrip('vV').strip()
+    core = re.split(r'[-+ _]', s, maxsplit=1)[0]
+    parts = re.findall(r'\d+', core)
+    if not parts:
+        return None
+    nums = [int(p) for p in parts[:4]]
+    nums += [0] * (4 - len(nums))
+    return tuple(nums) + (0 if len(s) > len(core) else 1,)
+
+
+def _newer(a, b):
+    """True when a is strictly newer than b. False if either side fails to
+    parse, because a version nobody can read must never trigger an update."""
+    pa, pb = _parse_version(a), _parse_version(b)
+    return pa is not None and pb is not None and pa > pb
+
+
+def _manifest_path():
+    return os.path.join(_addin_dir(), 'Helix3D.manifest')
+
+
+def _manifest_version(path=None):
+    """The version string out of a manifest on disk, or '' if unreadable."""
+    try:
+        with open(path or _manifest_path(), encoding='utf-8') as f:
+            return str(json.load(f).get('version', ''))
+    except (OSError, ValueError, AttributeError):
+        return ''
+
+
+_VERSION = _manifest_version()   # captured before any install can change the file
+
+
+def _restart_pending():
+    """The version sitting on disk waiting for a Fusion restart, or ''.
+
+    After an in-place install the manifest is newer than the module that read
+    it at import. _newer rather than != so a manual downgrade does not read as
+    a pending upgrade."""
+    on_disk = _manifest_version()
+    return on_disk if _newer(on_disk, _VERSION) else ''
+
+
+# --------------------------------------------------------------------------
+# Which kind of install is this
+# --------------------------------------------------------------------------
+def _stage_dir():
+    return os.path.join(_addin_dir(), '.helix3d-update')
+
+
+def _backup_dir():
+    return os.path.join(_addin_dir(), '.helix3d-backup')
+
+
+def _is_dev_install(folder=None):
+    """True when this looks like the repo rather than an installed copy.
+
+    Fusion can be pointed straight at a working tree, and overwriting one with
+    a release zip would throw away uncommitted work. .git is tested for
+    existence, not isdir, because a worktree or submodule checkout makes it a
+    file holding 'gitdir: ...'. Both the literal and the resolved path are
+    checked, in case the AddIns entry is a symlink or junction to the repo."""
+    roots = [folder] if folder else [_addin_dir(), os.path.dirname(os.path.realpath(__file__))]
+    for root in roots:
+        for marker in ('.git', '.github', '.gitignore', 'tools'):
+            if os.path.exists(os.path.join(root, marker)):
+                return True
+    return False
+
+
+def _is_managed_install(folder=None):
+    """True for an Autodesk App Store bundle, which the store's own updater
+    owns. Self-updating one would fight it."""
+    root = (folder or _addin_dir()).replace('\\', '/').lower().rstrip('/')
+    return '/applicationplugins/' in root + '/' or root.endswith('.bundle')
+
+
+def _may_install(folder=None):
+    """(True, '') when installing here is allowed, else (False, reason)."""
+    if _settings.get('update', {}).get('allowDevInstall'):
+        return True, ''
+    if _is_dev_install(folder):
+        return False, ('Helix3D is running from its source repository, so it will not '
+                       'replace its own files.')
+    if _is_managed_install(folder):
+        return False, ('Helix3D was installed from the Autodesk App Store, which handles '
+                       'its own updates.')
+    return True, ''
+
+
+# --------------------------------------------------------------------------
+# Settings: throttling, backoff, and what the user has already been told
+# --------------------------------------------------------------------------
+UPDATE_DEFAULTS = {
+    'enabled': True,
+    'nextCheck': 0.0,
+    'lastCheck': 0.0,
+    'failures': 0,
+    'etag': '',
+    'skipVersion': '',
+    'pendingVersion': '',
+    'pendingAt': 0.0,
+    'broken': '',
+}
+
+
+def _upd():
+    """The update section of the settings dict, created on first use.
+    Main thread only: _save_settings rewrites the whole dict, so a worker
+    writing here would race the dialog's own settings writes."""
+    u = _settings.get('update')
+    if not isinstance(u, dict):
+        u = {}
+        _settings['update'] = u
+    for k, v in UPDATE_DEFAULTS.items():
+        u.setdefault(k, v)
+    return u
+
+
+def _update_due(now=None):
+    """True when a check is allowed to run.
+
+    Wall clock, because the interval has to survive Fusion restarting. A
+    nextCheck more than a month out means the clock jumped backwards at some
+    point, and waiting for it would park the check for years."""
+    now = now if now is not None else time.time()
+    u = _upd()
+    if not u.get('enabled', True):
+        return False
+    try:
+        nxt = float(u.get('nextCheck') or 0)
+    except (TypeError, ValueError):
+        return True
+    if nxt > now + CLOCK_SANITY:
+        return True
+    return now >= nxt
+
+
+def _record_success(etag='', waiting=False):
+    """Note that the check went through.
+
+    waiting means a new version is sitting there unanswered, either because
+    the user said Later or because they never opened a helix command. Holding
+    the next check at now would make Fusion wait a full day before mentioning
+    it again, so the daily interval only starts once there is nothing left to
+    say."""
+    u = _upd()
+    u['lastCheck'] = time.time()
+    u['nextCheck'] = 0.0 if waiting else time.time() + CHECK_INTERVAL
+    u['failures'] = 0
+    if etag:
+        u['etag'] = etag
+    _save_settings()
+
+
+def _record_failure(reason, until=0.0):
+    """Back off 1, then 3, then 7 days, so a site that permanently cannot
+    reach GitHub is not retried every single day forever."""
+    u = _upd()
+    u['failures'] = int(u.get('failures') or 0) + 1
+    wait = BACKOFF[min(u['failures'], len(BACKOFF)) - 1]
+    u['lastCheck'] = time.time()
+    u['nextCheck'] = max(until, time.time() + wait)
+    _save_settings()
+    _log('Helix3D update check failed (%s). Next try in %d days.' % (reason, wait // 86400))
+
+
+def _should_offer(latest, skip=None, pending=None):
+    """False when there is nothing worth putting in front of the user.
+
+    The two versions can be passed in so the worker thread can ask the same
+    question without reading the settings dict."""
+    if not _newer(latest, _VERSION):
+        return False
+    if skip is None or pending is None:
+        u = _upd()
+        skip = u.get('skipVersion') or ''
+        pending = u.get('pendingVersion') or ''
+    # _newer rather than !=, so skipping 0.9.0 still surfaces 0.9.1.
+    if skip and not _newer(latest, skip):
+        return False
+    return not (pending and not _newer(latest, pending))
+
+
+def _clear_pending_if_restarted():
+    """Called once from run(). When the version now running has caught up with
+    the one that was downloaded, the restart happened. Returns the version to
+    confirm to the user, once, or ''."""
+    u = _upd()
+    pending = u.get('pendingVersion') or ''
+    if not pending:
+        return ''
+    if _newer(pending, _VERSION):
+        return ''                     # still waiting for the restart
+    u['pendingVersion'] = ''
+    u['pendingAt'] = 0.0
+    _save_settings()
+    return pending if pending == _VERSION else ''
+
+
+# --------------------------------------------------------------------------
+# Talking to GitHub. All of this runs on the worker thread: no Fusion calls,
+# no reads or writes of _settings.
+# --------------------------------------------------------------------------
+def _host_ok(url):
+    """True only for https on GitHub's own hosts.
+
+    hostname, never netloc: on https://github.com@evil.example/x the netloc is
+    'github.com@evil.example' and a prefix test would wave it through.
+    githubusercontent.com has to be here because a release asset always
+    redirects onto release-assets.githubusercontent.com."""
+    import urllib.parse
+    p = urllib.parse.urlsplit(url)
+    if p.scheme != 'https':
+        return False
+    host = (p.hostname or '').lower()
+    return host in OK_HOSTS or host.endswith(tuple('.' + h for h in OK_HOSTS))
+
+
+def _ssl_context():
+    """A verifying SSL context, or None when no trust anchors can be found.
+
+    Never returns an unverified context. A check that does not happen is the
+    right answer when the certificate chain cannot be checked; silently
+    trusting whatever answers is not.
+
+    On Windows CPython loads the ROOT store and this is one line. Everywhere
+    else it falls back to OpenSSL's compiled-in path, which Autodesk's build
+    may or may not populate, hence the ladder."""
+    global _ssl_ctx
+    if _ssl_ctx is not False:
+        return _ssl_ctx
+    import ssl
+    _ssl_ctx = None
+    try:
+        ctx = ssl.create_default_context()
+    except Exception:
+        _ulog('Helix3D: no SSL support, updates disabled.\n' + traceback.format_exc())
+        return None
+    if ctx.get_ca_certs():
+        _ssl_ctx = ctx
+        return ctx
+    if sys.platform == 'darwin':
+        for path in ('/etc/ssl/cert.pem', '/private/etc/ssl/cert.pem',
+                     '/opt/homebrew/etc/openssl@3/cert.pem',
+                     '/usr/local/etc/openssl@3/cert.pem'):
+            try:
+                ctx.load_verify_locations(cafile=path)
+            except (OSError, ssl.SSLError):
+                continue
+            if ctx.get_ca_certs():
+                _ssl_ctx = ctx
+                return ctx
+        try:
+            pem = _macos_keychain_roots()
+        except Exception:
+            # Reading the keychain is the last rung, and a surprise there must
+            # end in no update check, never in an exception out of a thread.
+            _ulog('Helix3D: could not read the keychain:\n' + traceback.format_exc())
+            pem = ''
+        if pem:
+            try:
+                ctx.load_verify_locations(cadata=pem)
+            except (ssl.SSLError, ValueError):
+                pass
+            if ctx.get_ca_certs():
+                _ssl_ctx = ctx
+                return ctx
+    _ulog('Helix3D: no certificate authorities available, skipping the update check.')
+    return None
+
+
+def _macos_keychain_roots():
+    """The system root certificates as PEM text, or ''.
+
+    System.keychain matters as much as the Apple bundle: a company that runs a
+    TLS-inspecting proxy puts its root there, and without it every request to
+    GitHub fails to verify. Two honest limits. This exports every certificate
+    in the keychain, including any the user marked Never Trust, and it does
+    not evaluate trust settings at all. It is still a real trust store, which
+    is the point: the ladder ends at giving up, never at trusting anything."""
+    import subprocess
+    out = []
+    for kc in ('/System/Library/Keychains/SystemRootCertificates.keychain',
+               '/Library/Keychains/System.keychain'):
+        try:
+            r = subprocess.run(['/usr/bin/security', 'find-certificate', '-a', '-p', kc],
+                               capture_output=True, text=True, timeout=20,
+                               stdin=subprocess.DEVNULL)
+        except (OSError, subprocess.SubprocessError):
+            continue
+        if r.returncode == 0 and 'BEGIN CERTIFICATE' in (r.stdout or ''):
+            out.append(r.stdout)
+    return '\n'.join(out)
+
+
+def _opener():
+    """An opener that re-checks the host on every redirect.
+
+    urllib follows redirects silently, so checking only the URL handed in
+    would check the one hop that is never the one that matters. ProxyHandler
+    with no arguments picks up the Windows and macOS system proxy settings.
+    Never install_opener(): add-ins share one interpreter and that would
+    change every other add-in's networking too."""
+    import urllib.request
+    ctx = _ssl_context()
+    if ctx is None:
+        raise _UpdateError('No certificate authorities are available to verify the connection.')
+
+    class _SafeRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, req, fp, code, msg, headers, newurl):
+            if not _host_ok(newurl):
+                raise _UpdateError('The download was redirected off GitHub.', newurl)
+            return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+    return urllib.request.build_opener(urllib.request.ProxyHandler(),
+                                       urllib.request.HTTPSHandler(context=ctx),
+                                       _SafeRedirect())
+
+
+def _http_get(url, headers=None, timeout=API_TIMEOUT, deadline=API_DEADLINE,
+              max_bytes=MAX_ZIP, min_bytes=0):
+    """GET url, returning (body bytes, response headers).
+
+    Read in chunks so the size cap and the wall clock are enforced against
+    what actually arrives. Content-Length is a claim, not a fact, and the
+    timeout on urlopen is per socket operation, so a slow drip would otherwise
+    hang for as long as it liked."""
+    import urllib.error
+    import urllib.request
+    if not _host_ok(url):
+        raise _UpdateError('Refused to fetch an address that is not on GitHub.', url)
+    hdrs = {'User-Agent': 'Helix3D/%s (+%s)' % (_VERSION or '0', GH_HOME),
+            'Accept-Encoding': 'identity'}
+    hdrs.update(headers or {})
+    req = urllib.request.Request(url, headers=hdrs)
+    give_up = time.time() + deadline
+    try:
+        resp = _opener().open(req, timeout=timeout)
+    except urllib.error.HTTPError:
+        raise
+    except _UpdateError:
+        raise
+    except Exception as e:
+        raise _UpdateError('Could not reach GitHub.', '%s: %s' % (type(e).__name__, e))
+    with resp:
+        declared = resp.headers.get('Content-Length')
+        if declared and declared.isdigit():
+            n = int(declared)
+            if n > max_bytes or (min_bytes and n < min_bytes):
+                raise _UpdateError('The download was not the size it should be.',
+                                   '%s bytes' % n)
+        chunks, total = [], 0
+        while True:
+            if time.time() > give_up:
+                raise _UpdateError('The download took too long.')
+            if _update_stop is not None and _update_stop.is_set():
+                raise _UpdateError('The update check was stopped.')
+            try:
+                chunk = resp.read(65536)
+            except Exception as e:
+                raise _UpdateError('The download was interrupted.',
+                                   '%s: %s' % (type(e).__name__, e))
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > max_bytes:
+                raise _UpdateError('The download was larger than it should be.')
+            chunks.append(chunk)
+        return b''.join(chunks), resp.headers
+
+
+def _fetch_latest(etag=''):
+    """The latest release as a dict, or None when GitHub answers 304.
+
+    Raises _UpdateError with `until` set when the rate limit is spent, so the
+    caller can wait for the reset rather than backing off blindly. Measured
+    against the live API: a 304 still costs one of the 60 requests an hour,
+    whatever the documentation says, so the ETag saves bandwidth and nothing
+    else."""
+    import urllib.error
+    headers = {'Accept': 'application/vnd.github+json',
+               'X-GitHub-Api-Version': '2022-11-28'}
+    if etag:
+        headers['If-None-Match'] = etag
+    try:
+        body, resp_headers = _http_get(GH_LATEST, headers, max_bytes=2_000_000)
+    except urllib.error.HTTPError as e:
+        if e.code == 304:
+            return None, etag
+        if e.code in (403, 429) and (e.headers or {}).get('x-ratelimit-remaining') == '0':
+            err = _UpdateError('GitHub is rate limiting this connection.', 'HTTP %d' % e.code)
+            try:
+                err.until = float(e.headers.get('x-ratelimit-reset', 0)) + 60
+            except (TypeError, ValueError):
+                err.until = time.time() + BACKOFF[0]
+            raise err
+        raise _UpdateError('GitHub answered with an error.', 'HTTP %d' % e.code)
+    try:
+        release = json.loads(body.decode('utf-8'))
+    except (UnicodeDecodeError, ValueError) as e:
+        raise _UpdateError('GitHub sent something that was not a release.', str(e))
+    if not isinstance(release, dict) or not release.get('tag_name'):
+        raise _UpdateError('GitHub sent a release with no tag.')
+    return release, resp_headers.get('ETag', '') or etag
+
+
+def _pick_asset(release, tag):
+    """(download url, declared size) for this release's zip.
+
+    A workflow run that half failed leaves a release with no asset on it, so
+    this is a real case rather than defensive padding."""
+    want = 'Helix3D-%s.zip' % tag.lstrip('vV')
+    for asset in release.get('assets') or []:
+        if not isinstance(asset, dict) or asset.get('name') != want:
+            continue
+        url = asset.get('browser_download_url') or ''
+        size = asset.get('size')
+        if not _host_ok(url):
+            raise _UpdateError('The release links its download somewhere other than GitHub.', url)
+        if not isinstance(size, int) or not MIN_ZIP <= size <= MAX_ZIP:
+            raise _UpdateError('The release download is not a plausible size.', repr(size))
+        return url, size
+    raise _UpdateError('That release has no %s to download.' % want)
+
+
+def _download(url, expect_size):
+    """The release zip as bytes.
+
+    Three size checks catching three different things: Content-Length rejects
+    an obviously wrong response before a byte is read, the running cap catches
+    a server that lied about it, and matching the API's own byte count exactly
+    catches truncation. That last one is the strong one, because the number
+    came down a separate connection."""
+    body, _ = _http_get(url, timeout=DL_TIMEOUT, deadline=DL_DEADLINE,
+                        max_bytes=MAX_ZIP, min_bytes=MIN_ZIP)
+    if len(body) != expect_size:
+        raise _UpdateError('The download did not arrive in one piece.',
+                           'got %d bytes, expected %d' % (len(body), expect_size))
+    return body
+
+
+# --------------------------------------------------------------------------
+# Unpacking a release, and checking it is what it claims to be
+# --------------------------------------------------------------------------
+def _safe_member(root_real, name):
+    """The absolute destination for a zip entry, or None if it must be
+    refused.
+
+    A backslash is worth its own test: 'a\\..\\..\\b' is one harmless
+    component on a Mac and a way out of the folder on Windows. realpath rather
+    than abspath because an earlier entry could have left a symlink for a
+    later one to write through."""
+    if not name or name.endswith('/'):
+        return None
+    if '\\' in name or name.startswith('/') or ':' in name:
+        return None
+    parts = name.split('/')
+    if any(p in ('', '.', '..') for p in parts):
+        return None
+    dest = os.path.realpath(os.path.join(root_real, *parts))
+    try:
+        if os.path.commonpath([root_real, dest]) != root_real:
+            return None
+    except ValueError:      # different drives on Windows
+        return None
+    return dest
+
+
+def _stage_release(blob, tag, into):
+    """Unpack the zip into `into` and check it thoroughly. Returns the path of
+    the unpacked Helix3D folder. Worker thread: no Fusion, no settings."""
+    import io
+    version = tag.lstrip('vV')
+    shutil.rmtree(into, ignore_errors=True)
+    os.makedirs(into, exist_ok=True)
+    root_real = os.path.realpath(into)
+    try:
+        zf = zipfile.ZipFile(io.BytesIO(blob))
+    except zipfile.BadZipFile as e:
+        raise _UpdateError('The download was not a usable zip file.', str(e))
+    with zf:
+        infos = zf.infolist()
+        # Both of these are checked before anything is written, which is the
+        # only moment a zip bomb can still be refused for free.
+        if len(infos) > MAX_ENTRIES:
+            raise _UpdateError('The download holds far more files than a release should.')
+        if sum(i.file_size for i in infos) > MAX_UNPACKED:
+            raise _UpdateError('The download unpacks to far more than a release should.')
+        tops = {n.split('/')[0] for n in zf.namelist() if n.strip()}
+        if tops != {'Helix3D'}:
+            raise _UpdateError('The download is not laid out like a Helix3D release.',
+                               'top level: %s' % sorted(tops))
+        names = set(zf.namelist())
+        for required in ('Helix3D/Helix3D.py', 'Helix3D/Helix3D.manifest'):
+            if required not in names:
+                raise _UpdateError('The download is missing %s.' % required.split('/')[-1])
+        for info in infos:
+            if stat.S_ISLNK(info.external_attr >> 16):
+                raise _UpdateError('The download contains a link where a file should be.',
+                                   info.filename)
+            if info.filename.endswith('/'):
+                continue
+            dest = _safe_member(root_real, info.filename)
+            if dest is None:
+                raise _UpdateError('The download tried to write outside its own folder.',
+                                   info.filename)
+            os.makedirs(os.path.dirname(dest), exist_ok=True)
+            with zf.open(info) as src, open(dest, 'wb') as out:
+                shutil.copyfileobj(src, out)
+        try:
+            source = zf.read('Helix3D/Helix3D.py').decode('utf-8')
+        except (UnicodeDecodeError, zipfile.BadZipFile) as e:
+            raise _UpdateError('The new Helix3D.py could not be read.', str(e))
+    # This proves the file parses, not that it works. The release workflow
+    # already compiles it, so this is really a check on the journey here.
+    try:
+        compile(source, 'Helix3D.py', 'exec')
+    except SyntaxError as e:
+        raise _UpdateError('The new Helix3D.py did not arrive intact.', str(e))
+    staged = os.path.join(into, 'Helix3D')
+    try:
+        with open(os.path.join(staged, 'Helix3D.manifest'), encoding='utf-8') as f:
+            manifest = json.load(f)
+    except (OSError, ValueError) as e:
+        raise _UpdateError('The new manifest could not be read.', str(e))
+    if str(manifest.get('version', '')) != version:
+        raise _UpdateError('The release is tagged %s but ships version %s.'
+                           % (version, manifest.get('version')))
+    if str(manifest.get('id', '')) != ADDIN_ID:
+        raise _UpdateError('The download is a different add-in, not Helix3D.')
+    if str(manifest.get('type', '')) != 'addin':
+        raise _UpdateError('The download is not an add-in.')
+    return staged
+
+
+# --------------------------------------------------------------------------
+# Putting the new files in place. Main thread: this serialises with the
+# settings writes, and nothing should read a half-copied resources folder.
+# --------------------------------------------------------------------------
+def _plan_files(staged):
+    """[(source, relative destination)] in the order they get installed.
+
+    Inert files first, then Helix3D.py, then the manifest last. The manifest
+    version is what says which version is installed, so until it moves the
+    folder still honestly describes the old one and every recovery path knows
+    where it stands."""
+    last = ('Helix3D.py', 'Helix3D.manifest')
+    plan = []
+    for root, dirs, files in os.walk(staged):
+        dirs.sort()
+        for name in sorted(files):
+            src = os.path.join(root, name)
+            rel = os.path.relpath(src, staged).replace('\\', '/')
+            if rel not in last:
+                plan.append((src, rel))
+    for rel in last:
+        src = os.path.join(staged, rel)
+        if os.path.isfile(src):
+            plan.append((src, rel))
+    return plan
+
+
+def _replace_file(src, dst, attempts=5):
+    """Move src onto dst, retrying a few times.
+
+    On a Mac this cannot fail for the reason people expect: rename unlinks the
+    old entry and anything still reading the old file keeps its own copy of
+    it. On Windows a PermissionError here means something else has the file
+    open, usually an antivirus scanner or the search indexer, and it normally
+    clears inside a second."""
+    wait = 0.2
+    for attempt in range(attempts):
+        try:
+            os.replace(src, dst)
+            return
+        except PermissionError:
+            if attempt == attempts - 1:
+                raise _UpdateError('Another program is holding %s open.'
+                                   % os.path.basename(dst))
+            time.sleep(wait)
+            wait *= 2
+        except OSError as e:
+            raise _UpdateError('Could not write %s.' % os.path.basename(dst), str(e))
+
+
+def _probe_writable(plan, folder):
+    """Open every file the install will replace and close it again.
+
+    Cheap and slightly racy, but it catches the whole class of failures worth
+    catching before anything has been touched: an add-in folder that needs
+    elevation, or a file something has pinned."""
+    for _, rel in plan:
+        dst = os.path.join(folder, rel.replace('/', os.sep))
+        if not os.path.isfile(dst):
+            continue
+        try:
+            with open(dst, 'r+b'):
+                pass
+        except OSError as e:
+            raise _UpdateError('Helix3D cannot write to its own folder, so it cannot '
+                               'update itself. Install the new version by hand.',
+                               '%s: %s' % (dst, e))
+
+
+def _purge_pycache(folder):
+    """Best effort. CPython invalidates a .pyc when the source mtime or size
+    stops matching, so a leftover one will not actually be used. Removing it
+    anyway costs a line and saves an afternoon of wondering why the old code
+    is still running."""
+    try:
+        shutil.rmtree(os.path.join(folder, '__pycache__'), ignore_errors=True)
+    except Exception:
+        pass
+
+
+def _backup(plan, folder, backup):
+    """Copy every file the install will replace into the backup folder."""
+    shutil.rmtree(backup, ignore_errors=True)
+    os.makedirs(backup, exist_ok=True)
+    saved = []
+    for _, rel in plan:
+        dst = os.path.join(folder, rel.replace('/', os.sep))
+        if not os.path.isfile(dst):
+            continue
+        keep = os.path.join(backup, rel.replace('/', os.sep))
+        os.makedirs(os.path.dirname(keep), exist_ok=True)
+        try:
+            shutil.copy2(dst, keep)
+        except OSError as e:
+            raise _UpdateError('Could not back up %s before replacing it.'
+                               % os.path.basename(dst), str(e))
+        saved.append(rel)
+    return saved
+
+
+def _rollback(saved, folder, backup):
+    """Put the backed-up files back, newest change first. Best effort by
+    nature: if a move failed going forward it can fail coming back. Returns
+    True only when everything was restored."""
+    whole = True
+    for rel in reversed(saved):
+        keep = os.path.join(backup, rel.replace('/', os.sep))
+        dst = os.path.join(folder, rel.replace('/', os.sep))
+        try:
+            shutil.copy2(keep, dst)
+        except OSError:
+            whole = False
+            _log('Helix3D could not restore %s:\n%s' % (rel, traceback.format_exc()))
+    return whole
+
+
+def _take_lock(stage):
+    """A lock file, so two Fusion windows cannot install at once. One older
+    than ten minutes is left over from a process that died."""
+    os.makedirs(stage, exist_ok=True)
+    path = os.path.join(stage, 'lock')
+    try:
+        if os.path.isfile(path) and time.time() - os.path.getmtime(path) > 600:
+            os.remove(path)
+    except OSError:
+        pass
+    try:
+        fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    except FileExistsError:
+        raise _UpdateError('Another Fusion window is already installing this update.')
+    except OSError as e:
+        raise _UpdateError('Could not start the install.', str(e))
+    os.close(fd)
+    return path
+
+
+def _release_lock(path):
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+
+
+def _install(staged, folder=None):
+    """Copy the staged release over the add-in folder.
+
+    Helix3D.settings.json and Helix3D.log are safe without doing anything:
+    they are not in the zip, so they are not in the plan, and nothing here
+    deletes. That is the main reason this copies file by file instead of
+    swapping the whole folder, which on Windows can fail outright when the
+    folder holds the running module."""
+    folder = folder or _addin_dir()
+    allowed, why = _may_install(folder)
+    if not allowed:
+        raise _UpdateError(why)
+    plan = _plan_files(staged)
+    if not plan:
+        raise _UpdateError('There was nothing to install.')
+    backup = _backup_dir()
+    lock = _take_lock(_stage_dir())
+    try:
+        _probe_writable(plan, folder)
+        saved = _backup(plan, folder, backup)
+        done = []
+        try:
+            for src, rel in plan:
+                if rel == 'Helix3D.py':
+                    _purge_pycache(folder)
+                dst = os.path.join(folder, rel.replace('/', os.sep))
+                os.makedirs(os.path.dirname(dst), exist_ok=True)
+                tmp = dst + '.helix3d-tmp'
+                shutil.copy2(src, tmp)
+                _replace_file(tmp, dst)
+                done.append(rel)
+        except Exception:
+            whole = _rollback(saved, folder, backup)
+            if not whole:
+                _upd()['broken'] = _VERSION
+                _save_settings()
+            raise
+        return len(done)
+    finally:
+        _release_lock(lock)
+
+
+def _clear_stage():
+    """Drop a staging folder left behind by a download that Fusion killed on
+    the way out. The backup folder is deliberately kept: it is the manual way
+    back to the previous version, and it is replaced at the start of the next
+    install rather than deleted at the end of this one."""
+    try:
+        shutil.rmtree(_stage_dir(), ignore_errors=True)
+    except Exception:
+        pass
+
+
+# --------------------------------------------------------------------------
+# The worker, and the bridge back to the main thread
+# --------------------------------------------------------------------------
+def _update_worker(etag, skip, pending, may_install, stop, gen):
+    """Ask GitHub, and download the new release if there is one.
+
+    Everything it needs out of the settings dict was read on the main thread
+    and handed over, because _save_settings rewrites the whole dict and two
+    threads writing it would lose one of them. It reports back by firing a
+    custom event with a small JSON payload rather than sharing a global."""
+    out = {'gen': gen}
+    try:
+        release, new_etag = _fetch_latest(etag)
+        out['etag'] = new_etag
+        if release is None:
+            out['state'] = 'current'          # 304, nothing has changed
+        else:
+            tag = str(release.get('tag_name') or '')
+            version = tag.lstrip('vV')
+            out['version'] = version
+            if not _should_offer(version, skip, pending):
+                out['state'] = 'current'
+            elif not may_install:
+                # Running from the repo. Worth knowing about, but nothing gets
+                # downloaded, because staging would litter the working tree.
+                out['state'] = 'noinstall'
+            else:
+                url, size = _pick_asset(release, tag)
+                if stop.is_set():
+                    return
+                out['staged'] = _stage_release(_download(url, size), tag, _stage_dir())
+                out['state'] = 'ready'
+    except _UpdateError as e:
+        out['state'] = 'failed'
+        out['reason'] = e.reason
+        out['until'] = getattr(e, 'until', 0.0)
+        _ulog('Helix3D update check: ' + str(e))
+    except Exception:
+        out['state'] = 'failed'
+        out['reason'] = 'Something went wrong while checking for updates.'
+        _ulog('Helix3D update check failed:\n' + traceback.format_exc())
+    if stop.is_set():
+        return
+    try:
+        app.fireCustomEvent(UPDATE_EVT, json.dumps(out))
+    except Exception:
+        pass
+
+
+class UpdateEvent(adsk.core.CustomEventHandler):
+    """Runs on the main thread, which is the only place the settings dict and
+    the Fusion API may be touched. It records what the worker found and stops
+    there; the question itself waits until the user has actually used the
+    add-in, so a message box never lands on top of Fusion still starting up."""
+    def notify(self, args):
+        global _update_ready
+        try:
+            out = json.loads(args.additionalInfo or '{}')
+            if out.get('gen') != _update_gen:
+                return                       # left over from a previous load
+            state = out.get('state')
+            if state == 'drain':
+                _drain_update()
+                return
+            if state == 'failed':
+                _record_failure(out.get('reason') or 'unknown', out.get('until') or 0.0)
+                return
+            _record_success(out.get('etag') or '', waiting=(state == 'ready'))
+            version = out.get('version') or ''
+            if state == 'noinstall':
+                _log('Helix3D %s has been released. This copy runs from its source '
+                     'repository, so pull it rather than updating in place.' % version)
+            elif state == 'ready':
+                # Only a session-long global, deliberately. pendingVersion in
+                # the settings file means "installed, waiting for a restart",
+                # and nothing else, so that a download the user postpones does
+                # not look like one they accepted.
+                _update_ready = (version, out.get('staged') or '')
+                _ulog('Helix3D %s downloaded and waiting to be offered.' % version)
+        except Exception:
+            _log('Helix3D update handler failed:\n' + traceback.format_exc())
+
+
+def _start_update_check(force=False):
+    """Main thread. Start the daily check on a daemon thread.
+
+    Nothing here blocks Fusion starting: the thread does the waiting, and the
+    answer comes back through the custom event."""
+    global _update_stop
+    try:
+        if not force and not _update_due():
+            return
+        allowed, _why = _may_install()
+        u = _upd()
+        stop = threading.Event()
+        _update_stop = stop
+        args = (u.get('etag') or '', u.get('skipVersion') or '',
+                u.get('pendingVersion') or '', allowed, stop, _update_gen)
+        threading.Thread(target=_update_worker, args=args, daemon=True).start()
+    except Exception:
+        _log('Helix3D could not start the update check:\n' + traceback.format_exc())
+
+
+def _stop_update_check():
+    global _update_stop, _update_gen
+    if _update_stop is not None:
+        _update_stop.set()
+    _update_stop = None
+    _update_gen += 1        # any event still in flight belongs to the old load
+
+
+# --------------------------------------------------------------------------
+# Asking the user
+# --------------------------------------------------------------------------
+def _ui_is_idle():
+    """True when no command is running, so a message box cannot land on top of
+    an open dialog."""
+    try:
+        return ui.activeCommand in ('', 'SelectCommand')
+    except Exception:
+        return False
+
+
+def _request_drain():
+    """Ask for the question to be put, once a Helix3D command has finished.
+
+    It goes through the custom event rather than being asked on the spot,
+    because commandTerminated fires while Fusion is still winding the command
+    down and a modal box blocks the very loop that has to finish doing it. By
+    the time the event is delivered the command is properly gone."""
+    if _update_asked or not (_update_ready or _pending_confirmed[0]):
+        return
+    try:
+        app.fireCustomEvent(UPDATE_EVT, json.dumps({'gen': _update_gen, 'state': 'drain'}))
+    except Exception:
+        pass
+
+
+def _drain_update():
+    """Put the question, having waited for a Helix3D command to finish, which
+    is proof the interface is alive and the user has reached for the tool.
+    Offers the download once per session, and confirms an update that a
+    restart has now made live."""
+    global _update_ready, _update_asked
+    if _update_asked or not _ui_is_idle():
+        return
+    done = _pending_confirmed[0]
+    if done:
+        _pending_confirmed[0] = ''
+        _update_asked = True
+        ui.messageBox('Helix3D is now running version %s.' % done, 'Helix3D')
+        return
+    if not _update_ready:
+        return
+    version, staged = _update_ready
+    _update_asked = True
+    answer = ui.messageBox(
+        'Helix3D %s is available. You are running %s.\n\n'
+        'Yes: install it now.\n'
+        'No: not now, ask again next time Fusion starts.\n'
+        'Cancel: skip this version for good.' % (version, _VERSION),
+        'Helix3D update',
+        adsk.core.MessageBoxButtonTypes.YesNoCancelButtonType,
+        adsk.core.MessageBoxIconTypes.QuestionIconType)
+    if answer == adsk.core.DialogResults.DialogCancel:
+        u = _upd()
+        u['skipVersion'] = version
+        _save_settings()
+        _update_ready = None
+        _clear_stage()
+        _log('Helix3D %s skipped at the user\'s request.' % version)
+        return
+    if answer != adsk.core.DialogResults.DialogYes:
+        # Later. The staging folder goes too, so the next session downloads
+        # again rather than trusting files nobody has looked at since. It is
+        # thirty kilobytes.
+        _update_ready = None
+        _clear_stage()
+        return
+    try:
+        _install(staged)
+    except _UpdateError as e:
+        _log('Helix3D %s failed to install: %s' % (version, e))
+        _update_ready = None
+        _clear_stage()
+        ui.messageBox('%s\n\nYou can download it yourself from\n%s'
+                      % (e.reason, GH_RELEASES), 'Helix3D update')
+        return
+    except Exception:
+        _log('Helix3D %s failed to install:\n%s' % (version, traceback.format_exc()))
+        _update_ready = None
+        _clear_stage()
+        ui.messageBox('Helix3D could not install the update. You can download it '
+                      'yourself from\n%s' % GH_RELEASES, 'Helix3D update')
+        return
+    u = _upd()
+    u['pendingVersion'] = version
+    u['pendingAt'] = time.time()
+    _save_settings()
+    _update_ready = None
+    _clear_stage()
+    _log('Helix3D %s installed, waiting for a restart.' % version)
+    # Restart Fusion, never "restart the add-in": Fusion only reads a manifest
+    # at startup, and a half-loaded add-in fails in ways that look like a bug.
+    ui.messageBox('Helix3D %s is installed.\n\nRestart Fusion to start using it.'
+                  % version, 'Helix3D update')
+
+
+def _update_startup():
+    """Called from run(). Tidies up after the previous session and starts a
+    check if one is due. Nothing here shows any interface."""
+    global _update_ready, _update_asked
+    try:
+        _update_ready, _update_asked = None, False
+        _clear_stage()
+        _pending_confirmed[0] = _clear_pending_if_restarted()
+        broken = _upd().get('broken') or ''
+        if broken:
+            _upd()['broken'] = ''
+            _save_settings()
+            _log('Helix3D could not fully undo a failed update. If the commands '
+                 'misbehave, reinstall from ' + GH_RELEASES)
+        waiting = _restart_pending()
+        if waiting:
+            _log('Helix3D %s is installed on disk. Restart Fusion to start using it.'
+                 % waiting)
+            return
+        _start_update_check()
+    except Exception:
+        _log('Helix3D update startup failed:\n' + traceback.format_exc())
 
 
 # --------------------------------------------------------------------------
@@ -2640,6 +3679,11 @@ def run(context):
         app.registerCustomEvent(VAR_POLL_EVT).add(h)
         _handlers.append(h)
 
+        app.unregisterCustomEvent(UPDATE_EVT)
+        h = UpdateEvent()
+        app.registerCustomEvent(UPDATE_EVT).add(h)
+        _handlers.append(h)
+
         h = CommandTerminated()
         ui.commandTerminated.add(h)
         _handlers.append(h)
@@ -2652,6 +3696,10 @@ def run(context):
                 if not panel.controls.itemById(cid):
                     ctrl = panel.controls.addCommand(cdef)
                     ctrl.isPromoted = True
+
+        # Last, and silent. It starts a thread and returns; nothing is shown
+        # until the user has finished with a helix command.
+        _update_startup()
     except Exception:
         ui.messageBox('Helix3D failed to start:\n' + traceback.format_exc())
 
@@ -2659,8 +3707,10 @@ def run(context):
 def stop(context):
     try:
         _stop_var_poll()
+        _stop_update_check()
         app.unregisterCustomEvent(TOUCH_EVT)
         app.unregisterCustomEvent(VAR_POLL_EVT)
+        app.unregisterCustomEvent(UPDATE_EVT)
         for pid in PANELS:
             panel = ui.allToolbarPanels.itemById(pid)
             for cid in (CMD_ID, VAR_CMD_ID):
