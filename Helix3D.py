@@ -47,6 +47,7 @@ PANELS = ('SketchCreatePanel', 'SolidCreatePanel')
 ICONS = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'resources')
 VAR_ICONS = os.path.join(ICONS, 'variable')   # same helix, uneven coils
 TOOLCLIPS = os.path.join(ICONS, 'toolclips')  # pictures Fusion shows inside a tooltip
+MODE_ICONS = os.path.join(ICONS, 'modes')     # one small glyph per item in the Mode list
 ATTR_GROUP = 'Helix3D'
 SAMPLES_PER_TURN = 24
 PREVIEW_SAMPLES_PER_TURN = 12   # previews only have to look right; see build_curve
@@ -55,6 +56,33 @@ MODES = ['Revolutions & Pitch', 'Revolutions & Height', 'Height & Pitch', 'Spira
          'Path & Pitch', 'Path & Revolutions']
 MODE_RP, MODE_RH, MODE_HP, MODE_SPIRAL, MODE_PP, MODE_PR = MODES
 PATH_MODES = (MODE_PP, MODE_PR)
+MODE_GLYPH_BY_MODE = {
+    MODE_RP: 'revolutions-pitch', MODE_RH: 'revolutions-height',
+    MODE_HP: 'height-pitch', MODE_SPIRAL: 'spiral',
+    MODE_PP: 'path-pitch', MODE_PR: 'path-revolutions',
+}
+MODE_HELP_BY_MODE = {
+    MODE_RP: ('You give the turns and the pitch',
+              'The height falls out of those two, turns times pitch. Reach for it when you '
+              'know how many coils you want and how far apart they sit.', 'dimensions.png'),
+    MODE_RH: ('You give the turns and the overall height',
+              'The pitch falls out. Use it when the helix has to fit a space and the number '
+              'of coils matters more than the gap between them.', 'dimensions.png'),
+    MODE_HP: ('You give the height and the pitch',
+              'The turns fall out, and you will not get a whole number unless the two divide '
+              'evenly. Use it when the spacing and the space are both already fixed.',
+              'dimensions.png'),
+    MODE_SPIRAL: ('A flat spiral that does not climb at all',
+                  'You give a start radius, an end radius and the turns. It stays in the '
+                  'plane, so there is no pitch and no taper to set.', 'spiral.png'),
+    MODE_PP: ('Wound around a curve, at a pitch you set',
+              'Pick a sketch curve or the edge of a body. Pitch is measured along the curve, '
+              'so the coils stay evenly spaced round a bend, and the turns fall out of how '
+              'long the curve is.', 'path.png'),
+    MODE_PR: ('Wound around a curve, for a set number of turns',
+              'Path & Pitch the other way round. You say how many turns to fit along the '
+              'curve, and the pitch falls out of how long it is.', 'path.png'),
+}
 # The variable pitch helix has its own command and its own dialog, so this is a
 # spec value rather than another item in the Mode dropdown.
 MODE_VAR = 'Variable Pitch'
@@ -640,10 +668,15 @@ def _add_inputs(inputs, spec=None, context='create', sketch=None):
     _seeded_end_radius = 'endRadius' in spec   # an existing end radius must not be overwritten
     v = lambda k, d: _seed(spec, k, d)
 
-    dd = inputs.addDropDownCommandInput('mode', 'Mode', adsk.core.DropDownStyles.TextListDropDownStyle)
+    # The icons only show on a labelled icon list; a plain text list takes the
+    # argument and ignores it. Fall back to text if the glyphs did not ship.
+    icons = [_mode_icon(m) for m in MODES]
+    style = (adsk.core.DropDownStyles.LabeledIconDropDownStyle if all(icons)
+             else adsk.core.DropDownStyles.TextListDropDownStyle)
+    dd = inputs.addDropDownCommandInput('mode', 'Mode', style)
     cur = spec.get('mode', MODE_RP)
-    for mname in MODES:
-        dd.listItems.add(mname, mname == cur)
+    for mname, folder in zip(MODES, icons):
+        dd.listItems.add(mname, mname == cur, folder)
     dd.isEnabled = context != 'edit_feature'  # can't add/remove params on an existing feature
 
     _add_pickers(inputs, spec, context)
@@ -678,11 +711,7 @@ def _add_const_tooltips(inputs):
     inputs are built, so all the wording sits in one place and the pickers and
     the placement triad, which are shared with the other command, get wording
     that suits this one."""
-    _tip(inputs, 'mode', 'Which two numbers you want to give it',
-         'Every mode builds the same kind of curve. What changes is which two values you '
-         'type and which one Fusion works out for you.<br><br>It greys out when you edit a '
-         'finished feature, because Fusion fixes which parameters a feature owns at the '
-         'moment it is created.')
+    _apply_mode_tooltip(inputs)
     _tip(inputs, 'path', 'The curve the helix winds around',
          'Pick a sketch curve or the edge of a body and the helix wraps round it instead of '
          'round a straight axis. Pitch is measured along the curve, so the coils stay evenly '
@@ -930,6 +959,37 @@ def _find(inputs, cid, depth=0):
             if hit:
                 return hit
     return None
+
+
+MODE_GLYPH = MODE_GLYPH_BY_MODE
+MODE_HELP = MODE_HELP_BY_MODE
+
+
+def _mode_icon(mode):
+    """Folder of glyphs for one mode, or empty if they did not ship."""
+    p = os.path.join(MODE_ICONS, MODE_GLYPH.get(mode, ''))
+    return p if MODE_GLYPH.get(mode) and os.path.isdir(p) else ''
+
+
+def _apply_mode_tooltip(inputs):
+    """Put the help for whichever mode is picked onto the dropdown itself.
+
+    A ListItem carries a name, an icon and nothing else, so there is no way to
+    give the six items a tooltip each. The parent's is rewritten as the
+    selection changes instead, which describes the mode you have landed on
+    rather than the one you are hovering over in the open list."""
+    dd = adsk.core.DropDownCommandInput.cast(_find(inputs, 'mode'))
+    if not dd or not dd.selectedItem or dd.selectedItem.name not in MODE_HELP:
+        return
+    title, body, clip = MODE_HELP[dd.selectedItem.name]
+    dd.tooltip = title
+    greyed = ('' if dd.isEnabled else
+              '<br><br>It is greyed out because Fusion fixes which parameters a feature owns '
+              'at the moment it is created, so changing mode means a new helix.')
+    dd.tooltipDescription = (
+        body + '<br><br>Every mode builds the same kind of curve. What changes is which two '
+        'values you type and which one Fusion works out for you.' + greyed)
+    dd.toolClipFilename = _clip(clip)
 
 
 def _clip(name):
@@ -2186,6 +2246,7 @@ class InputChanged(adsk.core.InputChangedEventHandler):
             if cid in ('mode', 'center', 'start', 'path', 'taperBy'):
                 _apply_mode_visibility(inputs)
             if cid == 'mode':
+                _apply_mode_tooltip(inputs)         # the help follows the mode
                 _focus_first_empty_picker(inputs)   # the pickers just changed
             _advance_focus(inputs, cid)
         except Exception:

@@ -362,7 +362,52 @@ def clip_path():
     return img
 
 
-CLIPS = (('taper.png', clip_taper), ('path.png', clip_path),
+def bracket(d, x, y0, y1, label):
+    """A measurement bracket with its name beside it."""
+    line(d, (x, y0), (x, y1), ORANGE, 1.3)
+    for y in (y0, y1):
+        line(d, (x - 4, y), (x + 4, y), ORANGE, 1.3)
+    text(d, (x + 8, (y0 + y1) / 2), label, F_SMALL, ORANGE, 'lm')
+
+
+def clip_dimensions():
+    """For the three straight modes: the three numbers, any two of which
+    settle the helix."""
+    img, d = canvas()
+    text(d, (W / 2, 20), 'three numbers, and each mode takes two of them', F_LABEL, INK, 'mm')
+    three = [{'turns': 3.0, 'pitch': 0.62, 'radius': 1.0}, {'pitch': 0.62, 'radius': 1.0}]
+    at = helix(d, three, (46, 36, 166, 156), True)
+    bracket(d, 182, at.edge(1.0, 1)[1], at.edge(2.0, 1)[1], 'pitch')
+    bracket(d, 246, at.edge(0.0, 1)[1], at.edge(3.0, 1)[1], 'height')
+    text(d, (106, 170), '3 turns', F_SMALL, ORANGE, 'mm')
+    caption(d, 'give it any two and Fusion works out the third')
+    return img
+
+
+def clip_spiral():
+    """For the flat spiral: no climb at all, just two radii."""
+    img, d = canvas()
+    text(d, (W / 2, 20), 'a flat spiral, with no climb at all', F_LABEL, INK, 'mm')
+    cx, cy, r0, r1, turns = 150.0, 104.0, 12.0, 66.0, 3.0
+    pts = []
+    for i in range(481):
+        t = i / 480.0
+        a = -math.pi / 2 + 2 * math.pi * turns * t
+        r = r0 + (r1 - r0) * t
+        pts.append((cx + r * math.cos(a), cy + r * math.sin(a)))
+    polyline(d, pts, BLUE, 1.8)
+    dot(d, pts[0], 2.6, GROUND, ORANGE, 1.3)
+    dot(d, pts[-1], 2.6, GROUND, ORANGE, 1.3)
+    line(d, (cx, cy), pts[0], ORANGE, 1.2)
+    line(d, (cx, cy), pts[-1], ORANGE, 1.2)
+    text(d, (cx + 6, cy - r0 / 2 - 2), 'start', F_SMALL, ORANGE, 'lm')
+    text(d, (cx + 6, cy - r1 / 2 - 2), 'end', F_SMALL, ORANGE, 'lm')
+    caption(d, 'a start radius, an end radius and the turns')
+    return img
+
+
+CLIPS = (('dimensions.png', clip_dimensions), ('spiral.png', clip_spiral),
+         ('taper.png', clip_taper), ('path.png', clip_path),
          ('pitch-rise.png', clip_pitch), ('turns.png', clip_turns),
          ('pitch.png', clip_pitch_cell), ('blend.png', clip_blend),
          ('ends.png', clip_ends), ('radius.png', clip_radius),
