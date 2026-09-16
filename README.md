@@ -93,7 +93,9 @@ Two stations at the same pitch give you an exactly constant run in between, with
 
 Nothing above is a picture of a coil. Sweep a section along one and you get a body like any other:
 
-![A spring swept along one of the helix curves](docs/images/swept-spring.png)
+![A progressive spring swept along a variable pitch helix](docs/images/swept-spring.png)
+
+That one is a progressive spring off the station table: five dead coils at 4.5 mm carrying three working coils at 29 mm, with closed flat ends at the 4 mm wire diameter.
 
 ## Installation
 
