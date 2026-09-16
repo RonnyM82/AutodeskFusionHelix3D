@@ -92,7 +92,9 @@ Nothing above is a picture of a coil. Sweep a section along one and you get a bo
 
    The zip already contains a folder called `Helix3D`, so extracting it puts everything where Fusion expects it. If you clone the repository instead, rename the folder to `Helix3D` so it matches `Helix3D.py` and `Helix3D.manifest`. Fusion will not see the add-in otherwise.
 3. In Fusion, go to **Utilities > Add-Ins**, find Helix3D on the Add-Ins tab, and run it. Tick "Run on Startup" if you want it back after a restart.
-4. The **3D Helix** and **Variable Pitch Helix** commands appear in the Sketch Create and Solid Create panels.
+4. The **Constant Helix** and **Variable Pitch Helix** commands sit in the Sketch Create and Solid Create panels, in the dropdown at the bottom of the panel rather than on the ribbon itself. If you reach for one often, right-click it there and choose **Pin to Toolbar**.
+
+NOTE: earlier versions put both buttons straight on the ribbon. If you have just updated and they have disappeared, that dropdown is where they went.
 
 IMPORTANT: if you change the manifest, restart Fusion completely. Fusion only reads it at startup, and a half-loaded add-in fails in ways that look like a bug in the command.
 
@@ -116,7 +118,7 @@ The command behaves differently depending on whether you are in a sketch when yo
 
 Start the command with nothing being edited. You get a **Helix** feature in the timeline, wrapping a 3D sketch that holds the curve, and its values appear as rows in the Parameters dialog like any other feature.
 
-1. Click **3D Helix** in the Sketch Create or Solid Create panel.
+1. Click **Constant Helix** in the Sketch Create or Solid Create panel.
 2. Pick a **Mode**.
 3. Optionally pick a **Plane** for it to sit on. Leave it empty and it uses the XY plane, or the sketch plane belonging to the centre point you picked.
 4. Optionally pick a **Center Point** to put the axis through, and a **Start Point** to say where the curve begins. A start point drives the radius, the start angle and the height offset, so those fields hide while it is set.
@@ -129,10 +131,10 @@ NOTE: Mode and the Taper dropdown are greyed out when you edit an existing featu
 
 Start the command while you are editing a sketch and the curve goes into that sketch instead, with its definition stored on the curve.
 
-1. Start or edit a sketch, then click **3D Helix**.
+1. Start or edit a sketch, then click **Constant Helix**.
 2. Position it either with the **Placement** triad and its **Base plane** dropdown, or by picking a **Center Point** and **Start Point**. Set both points and the triad disappears, because the points now decide everything it was deciding.
 3. Leave **Finish sketch and create parametric feature** off to keep the curve in the sketch. Turn it on to close the sketch and wrap it as a Helix feature instead.
-4. To edit one later, select the curve, right-click, and choose **Edit 3D Helix**.
+4. To edit one later, select the curve, right-click, and choose **Edit Constant Helix**.
 
 An in-sketch helix follows its inputs the same way a feature does: type an expression that references a user parameter, or drag the point or path it is built on, and the curve rebuilds when the command finishes. The catch is that this only happens while the add-in is running, because the add-in is what re-evaluates it. The values also do not appear in the Parameters dialog, since the curve is not a feature. If you want rows in the Parameters dialog, use the timeline feature instead.
 

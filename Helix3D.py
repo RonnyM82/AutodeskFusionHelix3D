@@ -9,11 +9,11 @@ Two ways to use it:
 
 * Inside a sketch: adds the helix straight into the active sketch as a fixed
   spline, with its definition stored as attributes on the curve. Select the
-  curve, right-click > Edit 3D Helix to change it. Expressions referencing user
-  parameters are stored on the curve and re-evaluated after every command, so
-  the curve follows its parameters while the add-in is running. It is not a
-  custom feature (one can't wrap the sketch you're editing without swallowing
-  it), so the values don't appear as rows in the Parameters dialog.
+  curve, right-click > Edit Constant Helix to change it. Expressions that
+  reference user parameters are stored on the curve and re-evaluated after every
+  command, so the curve follows its parameters while the add-in is running. It is
+  not a custom feature (one can't wrap the sketch you're editing without
+  swallowing it), so the values don't appear as rows in the Parameters dialog.
 
 The curve is a degree-3 non-rational B-spline interpolating sampled helix
 points with exact end tangents. No solids or surfaces are involved.
@@ -83,8 +83,13 @@ TOUCH_EVT = 'scottHelix3DDeferredTouch'
 VAR_POLL_EVT = 'scottHelix3DVarPoll'
 _touch_pending = set()  # entity tokens of features rebuilt by compute since the last touch
 _touching = False
+_creating = False       # a custom feature is being added right now
+_create_computes = set()  # tokens that computed during that add
+_in_execute = False     # one of our execute handlers is running
+_execute_computes = set()  # tokens that computed during it, touched before it returns
 _editing_curve = None   # SketchFixedSpline in the sketch edit dialog
-_origin_restore = None  # (component, previous lightbulb state)
+_origin_restore = None  # component whose origin folder we lit (None if it was already lit)
+_edit_sketch_hidden = False  # the edit dialog hid the feature's own sketch
 _pending_triad = None   # Matrix3D to push onto the triad when the dialog activates
 _pending_selections = []  # [(input id, entity)] to select once the dialog activates
 LOG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'Helix3D.log')
@@ -809,7 +814,10 @@ def _add_placement(inputs, spec, sketch):
 
 
 def _apply_mode_visibility(inputs):
-    mode = adsk.core.DropDownCommandInput.cast(inputs.itemById('mode')).selectedItem.name
+    dd = adsk.core.DropDownCommandInput.cast(inputs.itemById('mode'))
+    if not dd:
+        return   # the variable pitch dialog: a station table, no modes, none of these fields
+    mode = dd.selectedItem.name
     path_mode = mode in PATH_MODES
     show = {
         MODE_RP: ('pitch', 'turns', 'taper'),
@@ -1707,20 +1715,47 @@ PARAM_META = {  # id: (display name, unit key)
 
 
 def _show_origin(on):
-    """Temporarily light the active component's origin while picking a plane."""
+    """Temporarily light the active component's origin while picking a plane.
+
+    The light bulb is document state, so every write Fusion sees becomes its
+    own undo entry. Never write a value that is already there, and let execute
+    do the switching back (the destroy handler then only covers a cancel), so
+    a completed command leaves one entry instead of three.
+    """
     global _origin_restore
     try:
-        des = adsk.fusion.Design.cast(app.activeProduct)
-        comp = des.activeComponent
         if on:
-            _origin_restore = (comp, comp.isOriginFolderLightBulbOn)
-            comp.isOriginFolderLightBulbOn = True
+            if _origin_restore:
+                return   # activate re-fires after every pan/orbit; light it once
+            comp = adsk.fusion.Design.cast(app.activeProduct).activeComponent
+            if not comp.isOriginFolderLightBulbOn:
+                comp.isOriginFolderLightBulbOn = True
+                _origin_restore = comp
         elif _origin_restore:
-            c, prev = _origin_restore
-            c.isOriginFolderLightBulbOn = prev
-            _origin_restore = None
+            comp, _origin_restore = _origin_restore, None
+            if comp.isValid and comp.isOriginFolderLightBulbOn:
+                comp.isOriginFolderLightBulbOn = False
     except Exception:
         _origin_restore = None
+
+
+def _hide_edit_sketch(sk):
+    """Hide the sketch a feature edit is previewing over. Same undo problem as
+    _show_origin: write it once, and switch it back from execute."""
+    global _edit_sketch_hidden
+    if sk and sk.isValid and sk.isVisible:
+        sk.isVisible = False
+        _edit_sketch_hidden = True
+
+
+def _restore_edit_sketch():
+    global _edit_sketch_hidden
+    if not _edit_sketch_hidden:
+        return
+    _edit_sketch_hidden = False
+    sk = _sketch_of(_editing) if _editing else None
+    if sk and sk.isValid and not sk.isVisible:
+        sk.isVisible = True
 
 
 # --------------------------------------------------------------------------
@@ -1801,10 +1836,50 @@ def _dep_entity(cf, dep_id):
     return d.entity if d else None
 
 
+def _param_id_set(cf):
+    return frozenset(cf.parameters.item(i).id for i in range(cf.parameters.count))
+
+
+def _mode_from_params(cf):
+    """(mode, taper style) worked out from the parameters a feature carries.
+
+    The mode is kept as a named value, but those are written after
+    customFeatures.add and adding is what triggers the first compute, so a
+    rebuild can read it back empty. Assuming a mode then asks the spec for a
+    parameter that mode's helix hasn't got, which is where the KeyErrors in the
+    log came from. The parameter names say which mode it is without guessing.
+    """
+    ids = _param_id_set(cf)
+    if not ids:
+        return None, None
+    if any(i != 'radius' and i.startswith('radius') for i in ids):
+        return MODE_VAR, 'angle'   # numbered stations; no other mode has them
+    found = []
+    for mode in MODES:
+        for taper_by in ('angle', 'radius'):
+            if frozenset(_param_ids(mode, taper_by)) == ids:
+                found.append((mode, taper_by))
+                break   # a mode with no taper parameter matches both styles
+    if len(found) > 1:
+        # A flat spiral and a path helix driven by revolutions carry the same
+        # parameter names; only the path tells them apart.
+        has_path = cf.dependencies.itemById('path') is not None
+        found = [f for f in found if (f[0] in PATH_MODES) == has_path]
+    return found[0] if len(found) == 1 else (None, None)
+
+
 def _spec_of_feature(cf):
-    spec = {'mode': cf.customNamedValues.value('mode') or MODE_RP,
+    mode = cf.customNamedValues.value('mode')
+    taper_by = cf.customNamedValues.value('taperBy')
+    if not mode or not taper_by:
+        by_params = _mode_from_params(cf)
+        mode, taper_by = mode or by_params[0], taper_by or by_params[1] or 'angle'
+    if not mode:
+        raise HelixError('This helix has no mode stored on it and its parameters '
+                         'do not match any mode, so there is nothing to rebuild it from.')
+    spec = {'mode': mode,
             'hand': cf.customNamedValues.value('hand') or 'right',
-            'taperBy': cf.customNamedValues.value('taperBy') or 'angle',
+            'taperBy': taper_by,
             'flip': cf.customNamedValues.value('flip') == '1',
             'expr': {},
             '_deps': {k: _dep_entity(cf, k) for k in ('center', 'start', 'path')}}
@@ -1813,10 +1888,15 @@ def _spec_of_feature(cf):
         spec[p.id] = p.value
         spec['expr'][p.id] = p.expression   # so reopening the dialog keeps it
     if spec['mode'] == MODE_VAR:
+        ids = _param_id_set(cf)
         spec['blend'] = cf.customNamedValues.value('blend') or 'smooth'
-        spec['startType'] = cf.customNamedValues.value('startType') or 'natural'
-        spec['endType'] = cf.customNamedValues.value('endType') or 'natural'
-        spec['stations'] = [{} for _ in range(int(cf.customNamedValues.value('stations') or 0))]
+        spec['startType'] = cf.customNamedValues.value('startType') or (
+            'flat' if 'startPitch' in ids else 'natural')
+        spec['endType'] = cf.customNamedValues.value('endType') or (
+            'flat' if 'endPitch' in ids else 'natural')
+        n = int(cf.customNamedValues.value('stations') or 0) or sum(
+            1 for i in ids if i != 'radius' and i.startswith('radius'))
+        spec['stations'] = [{} for _ in range(n)]
         _stations_from_values(spec)
     return spec
 
@@ -1842,6 +1922,32 @@ def _touch_sketch(sk):
     curve (a sweep stays stale until Compute All). Adding and deleting a point
     is, but only as a fresh edit, not from inside the feature's own compute."""
     sk.sketchPoints.add(adsk.core.Point3D.create(0, 0, 0)).deleteMe()
+
+
+def _flush_execute_touches():
+    """Touch the sketches of every feature that recomputed during this execute.
+
+    Done here rather than from the compute handler for two reasons: an edit made
+    from inside a feature's own compute is not seen by the features built on it,
+    and anything done in execute joins the command's single undo entry instead
+    of leaving one of its own behind.
+    """
+    global _touching
+    if not _execute_computes:
+        return
+    tokens = set(_execute_computes)
+    _execute_computes.clear()
+    des = adsk.fusion.Design.cast(app.activeProduct)
+    _touching = True
+    try:
+        for tok in tokens:
+            for e in des.findEntityByToken(tok):
+                cf = adsk.fusion.CustomFeature.cast(e)
+                sk = _sketch_of(cf) if cf and cf.isValid else None
+                if sk and sk.isValid:
+                    _touch_sketch(sk)
+    finally:
+        _touching = False
 
 
 def _draw_preview(comp, curve):
@@ -1968,9 +2074,21 @@ class ComputeHandler(adsk.fusion.CustomFeatureEventHandler):
         try:
             cf = adsk.fusion.CustomFeatureEventArgs.cast(args).customFeature
             _rebuild_feature(cf)
-            if not _touching:
-                _touch_pending.add(cf.entityToken)
-                app.fireCustomEvent(TOUCH_EVT)   # handled once Fusion is idle again
+            if _touching:
+                return
+            if _creating:
+                # Sorted out by _create_feature once the insert is finished: the
+                # new feature needs no touch, but anything else that recomputed
+                # on the way past does.
+                _create_computes.add(cf.entityToken)
+                return
+            if _in_execute:
+                _execute_computes.add(cf.entityToken)   # see _flush_execute_touches
+                return
+            _touch_pending.add(cf.entityToken)
+            app.fireCustomEvent(TOUCH_EVT)   # handled once Fusion is idle again
+        except HelixError as e:
+            _log('Helix3D compute skipped: %s' % e)
         except Exception:
             _log('Helix3D compute failed:\n' + traceback.format_exc())
 
@@ -1982,7 +2100,7 @@ class DeferredTouch(adsk.core.CustomEventHandler):
         global _touching
         try:
             if ui.activeCommand in OUR_COMMANDS:
-                return   # left pending; the next compute fires again
+                return   # left pending; CommandTerminated fires the event again
             des = adsk.fusion.Design.cast(app.activeProduct)
             tokens = set(_touch_pending)
             _touch_pending.clear()
@@ -2157,6 +2275,7 @@ def _create_sketch(comp, plane, spec, center_ent=None, start_ent=None, path_ent=
 
 
 def _create_feature(comp, plane, spec, center_ent=None, start_ent=None, path_ent=None):
+    global _creating
     units = _units()
     var = spec['mode'] == MODE_VAR
     sk = _create_sketch(comp, plane, spec, center_ent, start_ent, path_ent)
@@ -2175,7 +2294,12 @@ def _create_feature(comp, plane, spec, center_ent=None, start_ent=None, path_ent
     if path_ent:
         cfi.addDependency('path', path_ent)
     cfi.setStartAndEndFeatures(sk, sk)
-    cf = comp.features.customFeatures.add(cfi)
+    _create_computes.clear()
+    _creating = True
+    try:
+        cf = comp.features.customFeatures.add(cfi)
+    finally:
+        _creating = False
     cf.customNamedValues.addOrSetValue('mode', spec['mode'])
     cf.customNamedValues.addOrSetValue('hand', spec['hand'])
     cf.customNamedValues.addOrSetValue('flip', '1' if spec.get('flip') else '0')
@@ -2186,6 +2310,15 @@ def _create_feature(comp, plane, spec, center_ent=None, start_ent=None, path_ent
         cf.customNamedValues.addOrSetValue('endType', spec.get('endType', 'natural'))
     else:
         cf.customNamedValues.addOrSetValue('taperBy', spec.get('taperBy', 'angle'))
+    # A feature created a moment ago can have nothing built on it, so the touch
+    # its first compute would queue is pure undo clutter. Inserting at a rolled
+    # back marker does recompute every later feature, though, and those can have
+    # things built on them.
+    _create_computes.discard(cf.entityToken)
+    if _create_computes:
+        _touch_pending.update(_create_computes)
+        _create_computes.clear()
+        app.fireCustomEvent(TOUCH_EVT)
     return cf
 
 
@@ -2204,6 +2337,9 @@ def _feature_placement(inputs, comp):
 class CreateExecute(adsk.core.CommandEventHandler):
     def notify(self, args):
         try:
+            # Inside execute, so it lands in this command's undo entry rather
+            # than making one of its own.
+            _show_origin(False)
             inputs = adsk.core.CommandEventArgs.cast(args).command.commandInputs
             sk = _in_sketch()
             spec = _read_any_spec(inputs, sk)
@@ -2252,10 +2388,18 @@ class CreatePreview(adsk.core.CommandEventHandler):
             _log('Helix3D preview failed:\n' + traceback.format_exc())
 
 
+class CreateActivate(adsk.core.CommandEventHandler):
+    """Light the origin from activate rather than commandCreated: commandCreated
+    runs before the command's undo step opens, so the switch would sit outside
+    it as an entry of its own."""
+    def notify(self, args):
+        _show_origin(True)
+
+
 class CreateDestroy(adsk.core.CommandEventHandler):
     def notify(self, args):
         _stop_var_poll()
-        _show_origin(False)
+        _show_origin(False)   # only does anything if the command was cancelled
         try:
             _remember_placement_group(adsk.core.CommandEventArgs.cast(args).command.commandInputs)
         except Exception:
@@ -2277,9 +2421,8 @@ class CreateCreated(adsk.core.CommandCreatedEventHandler):
             if self.variable:
                 _size_var_dialog(cmd)
                 _start_var_poll(cmd)
-            if not _in_sketch():
-                _show_origin(True)
-            _wire(cmd, CreateExecute(), TriadActivate() if _in_sketch() else None, CreateDestroy(),
+            _wire(cmd, CreateExecute(),
+                  TriadActivate() if _in_sketch() else CreateActivate(), CreateDestroy(),
                   CreatePreview())
         except Exception:
             ui.messageBox('Helix3D command failed:\n' + traceback.format_exc())
@@ -2300,6 +2443,9 @@ def _describe(ent):
 
 class EditExecute(adsk.core.CommandEventHandler):
     def notify(self, args):
+        global _in_execute
+        _in_execute = True
+        _execute_computes.clear()
         try:
             inputs = adsk.core.CommandEventArgs.cast(args).command.commandInputs
             spec = _read_any_spec(inputs)
@@ -2333,6 +2479,12 @@ class EditExecute(adsk.core.CommandEventHandler):
             _log('Helix3D edit: dependencies now ' + ', '.join(
                 '%s=%s' % (cf.dependencies.item(i).id, _describe(cf.dependencies.item(i).entity))
                 for i in range(cf.dependencies.count)))
+            # The mode dropdown is disabled while editing, so these can only
+            # rewrite what is already there - which repairs a feature whose
+            # named values went missing.
+            cf.customNamedValues.addOrSetValue('mode', spec['mode'])
+            if spec['mode'] != MODE_VAR:
+                cf.customNamedValues.addOrSetValue('taperBy', spec.get('taperBy', 'angle'))
             cf.customNamedValues.addOrSetValue('hand', spec['hand'])
             cf.customNamedValues.addOrSetValue('flip', '1' if spec.get('flip') else '0')
             if spec['mode'] == MODE_VAR:
@@ -2343,10 +2495,20 @@ class EditExecute(adsk.core.CommandEventHandler):
             _restore_timeline()
             # Direction and points aren't parameters, so rebuild explicitly.
             _rebuild_feature(cf)
+            _flush_execute_touches()
+            _restore_edit_sketch()   # inside execute, so it costs no undo entry
         except HelixError as e:
             ui.messageBox(str(e), 'Helix3D')
         except Exception:
             ui.messageBox('Helix3D edit failed:\n' + traceback.format_exc())
+        finally:
+            _in_execute = False
+            # Anything left uncollected came from a path that raised; hand it
+            # to the deferred touch rather than lose it.
+            if _execute_computes:
+                _touch_pending.update(_execute_computes)
+                _execute_computes.clear()
+                app.fireCustomEvent(TOUCH_EVT)
 
 
 def _effective_point(inputs, sid):
@@ -2369,16 +2531,17 @@ class EditPreview(adsk.core.CommandEventHandler):
             center, start = _effective_point(inputs, 'center'), _effective_point(inputs, 'start')
             _apply_points(_model_to_sketch(_editing_xf), spec, center, start)
             _attach_path(spec, _editing_xf, _effective_point(inputs, 'path'))
-            _log('Helix3D edit preview: picker center=%s start=%s; using center=%s start=%s radius=%.4f'
+            r = spec.get('radius')
+            if r is None and spec.get('stations'):
+                r = spec['stations'][0].get('radius')   # variable pitch: one per station
+            _log('Helix3D edit preview: picker center=%s start=%s; using center=%s start=%s radius=%s'
                  % (_describe(_picked(inputs, 'center')), _describe(_picked(inputs, 'start')),
-                    _describe(center), _describe(start), spec['radius']))
+                    _describe(center), _describe(start), 'n/a' if r is None else '%.4f' % r))
             try:
                 curve = build_curve(spec, PREVIEW_SAMPLES_PER_TURN)
             except HelixError:
                 return
-            sk = _sketch_of(_editing)
-            if sk:
-                sk.isVisible = False
+            _hide_edit_sketch(_sketch_of(_editing))
             curve.transformBy(_editing_xf)
             _draw_preview(_editing.parentComponent, curve)
             _show_highlight(spec, _editing.parentComponent, _editing_xf)
@@ -2441,9 +2604,7 @@ class EditDestroy(adsk.core.CommandEventHandler):
         _stop_var_poll()
         try:
             _restore_timeline()
-            sk = _sketch_of(_editing)
-            if sk:
-                sk.isVisible = True
+            _restore_edit_sketch()   # only does anything if the edit was cancelled
         except Exception:
             _log('Helix3D edit destroy failed:\n' + traceback.format_exc())
         _editing = _editing_xf = _editing_restore = None
@@ -2452,9 +2613,10 @@ class EditDestroy(adsk.core.CommandEventHandler):
 class EditCreated(adsk.core.CommandCreatedEventHandler):
     def notify(self, args):
         global _editing, _editing_xf, _editing_restore, _editing_rolled, _editing_activated
-        global _editing_deps, _touched, _touch_armed
+        global _editing_deps, _touched, _touch_armed, _edit_sketch_hidden
         try:
             cmd = adsk.core.CommandCreatedEventArgs.cast(args).command
+            _edit_sketch_hidden = False
             _editing = adsk.fusion.CustomFeature.cast(ui.activeSelections.item(0).entity)
             _editing_xf = _sketch_of(_editing).transform
             tl = _timeline()
@@ -2571,14 +2733,19 @@ class CommandTerminated(adsk.core.ApplicationCommandEventHandler):
     def notify(self, args):
         try:
             cid = adsk.core.ApplicationCommandEventArgs.cast(args).commandId
+            _remember_pins()   # catches a pin even if Fusion never reaches stop()
             if cid in OUR_COMMANDS:
                 # The user has just used the add-in, so the interface is up and
                 # they are between jobs. That is when an update gets mentioned.
                 _request_drain()
-            if cid in OUR_COMMANDS or cid == 'SelectCommand':
-                return
             # Pan/orbit terminate too; don't touch the model under one of our dialogs.
             if ui.activeCommand in OUR_COMMANDS:
+                return
+            if _touch_pending:
+                # DeferredTouch holds off while one of our dialogs is up, and
+                # nothing else brings it back.
+                app.fireCustomEvent(TOUCH_EVT)
+            if cid in OUR_COMMANDS or cid == 'SelectCommand':
                 return
             _refresh_sketch_helices()
         except Exception:
@@ -3628,6 +3795,35 @@ def _update_startup():
 # --------------------------------------------------------------------------
 # Add-in entry points
 # --------------------------------------------------------------------------
+def _pin_key(pid, cid):
+    return '%s/%s' % (pid, cid)
+
+
+def _remember_pins():
+    """Keep track of which buttons the user has pinned to the ribbon.
+
+    Fusion will not do it for us: stop() deletes our controls and run() makes
+    new ones, and a new control comes up unpinned however the old one was left.
+    So it is read back here and put in the settings file, which the updater
+    leaves alone, and applied again when the controls are rebuilt.
+    """
+    try:
+        pins = _settings.setdefault('pinned', {})
+        changed = False
+        for pid in PANELS:
+            panel = ui.allToolbarPanels.itemById(pid)
+            for cid in (CMD_ID, VAR_CMD_ID):
+                ctrl = panel.controls.itemById(cid) if panel else None
+                if ctrl and pins.get(_pin_key(pid, cid)) != ctrl.isPromoted:
+                    pins[_pin_key(pid, cid)] = ctrl.isPromoted
+                    changed = True
+        if changed:
+            _save_settings()
+    except Exception:
+        _log('Helix3D could not read the pinned buttons:\n'
+             + traceback.format_exc())
+
+
 def _button(cid, name, tip, handler, icons=ICONS):
     old = ui.commandDefinitions.itemById(cid)
     if old:
@@ -3641,9 +3837,10 @@ def _button(cid, name, tip, handler, icons=ICONS):
 def run(context):
     global _def, _def_var
     try:
-        create_def = _button(CMD_ID, '3D Helix', 'Create a 3D helix or spiral sketch curve', CreateCreated())
-        _button(EDIT_ID, 'Edit 3D Helix', 'Edit a parametric 3D helix', EditCreated())
-        _button(SKETCH_EDIT_ID, 'Edit 3D Helix', 'Edit this helix curve', SketchEditCreated())
+        create_def = _button(CMD_ID, 'Constant Helix',
+                             'Create a 3D helix or spiral sketch curve', CreateCreated())
+        _button(EDIT_ID, 'Edit Constant Helix', 'Edit a parametric constant helix', EditCreated())
+        _button(SKETCH_EDIT_ID, 'Edit Constant Helix', 'Edit this helix curve', SketchEditCreated())
         var_def = _button(VAR_CMD_ID, 'Variable Pitch Helix',
                           'Create a helix whose pitch and radius change along its length, '
                           'for progressive springs and timing screws',
@@ -3695,7 +3892,10 @@ def run(context):
             for cid, cdef in ((CMD_ID, create_def), (VAR_CMD_ID, var_def)):
                 if not panel.controls.itemById(cid):
                     ctrl = panel.controls.addCommand(cdef)
-                    ctrl.isPromoted = True
+                    # Subtle by default: the panel's dropdown, not the ribbon,
+                    # unless the user has pinned it (see _remember_pins).
+                    ctrl.isPromotedByDefault = False
+                    ctrl.isPromoted = _settings.get('pinned', {}).get(_pin_key(pid, cid), False)
 
         # Last, and silent. It starts a thread and returns; nothing is shown
         # until the user has finished with a helix command.
@@ -3711,6 +3911,7 @@ def stop(context):
         app.unregisterCustomEvent(TOUCH_EVT)
         app.unregisterCustomEvent(VAR_POLL_EVT)
         app.unregisterCustomEvent(UPDATE_EVT)
+        _remember_pins()   # before the controls go, or the choice goes with them
         for pid in PANELS:
             panel = ui.allToolbarPanels.itemById(pid)
             for cid in (CMD_ID, VAR_CMD_ID):
