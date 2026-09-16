@@ -1396,17 +1396,28 @@ def _add_var_tooltips(inputs):
         _tip(inputs, side + 'Type', 'How the %s of the helix is finished' % label.lower(),
              'Natural begins right at the station, with nothing added.<br><br>Flat adds a '
              'run of coil at a pitch you choose, then eases %s the station over the '
-             'transition turns.' % into, 'ends.png')
+             'transition turns. It is only as flat as the pitch you give it, and that '
+             'starts at zero, which is the flat everyone means.' % into, 'ends.png')
         _tip(inputs, side + 'Pitch', 'How far the flat run climbs in one turn',
-             'Set it to zero for a true flat, which is what a dwell on a timing screw '
-             'needs. For a closed spring end use the wire diameter, or the coils will '
-             'pass through each other when you sweep it.', 'ends.png')
+             'Zero is the true flat, sitting at right angles to the axis the whole way '
+             'round, and it is what Inventor gives you and what a dwell on a timing screw '
+             'needs. Anything above zero is a slow coil rather than a flat, so if the end '
+             'still looks like it is climbing, this box is why.<br><br>A closed spring end '
+             'is the reason to put a number in it. A true flat carried for a whole turn '
+             'brings the wire back round onto itself, so give it the wire diameter and the '
+             'coil clears instead.', 'ends.png')
         _tip(inputs, side + 'Flat', 'How many turns the flat run goes on for',
              'On a spring this is the dead coil that sits against the seat. On a timing '
-             'screw it is how long the container is held still for.', 'ends.png')
+             'screw it is how long the container is held still for.<br><br>Inventor asks '
+             'for this in degrees, so divide by 360 to get what goes here. A quarter turn '
+             'is 90 degrees, half a turn is 180.', 'ends.png')
         _tip(inputs, side + 'Blend', 'How many turns it takes to ease %s the station' % into,
              'Spread over more turns it changes more gently. Too short and the coil has to '
-             'bend sharply to catch up.', 'ends.png')
+             'bend sharply to catch up.<br><br>This is the run that does the climbing out of '
+             'a flat end, so it wants the working pitch at station 1 to climb to. Give '
+             'station 1 some middling pitch instead and the climb gets spread over the '
+             'stations beyond it, which reads as a long ramp rather than an end.<br><br>'
+             'Inventor asks for this in degrees too, so divide by 360.', 'ends.png')
     _tip(inputs, 'winding_grp', 'Which way the helix turns and where it starts',
          'None of this changes the pitch or the height, only the direction it winds and '
          'the point on the circle it begins from.')
@@ -1434,15 +1445,19 @@ def _add_station_row(table, k, turns, pitch, radius, lu, slack=False):
     p.tooltipDescription = (
         'Pitch is a rate, measured at this one point. Between two stations it blends to the '
         'next value, so the run rises by the average of the two and climbs less than the '
-        'larger pitch would suggest on its own.')
+        'larger pitch would suggest on its own.<br><br>It greys out when this station is the '
+        'one giving way to a pinned height, because the pitch here is then worked out for '
+        'you rather than typed.')
     p.toolClipFilename = _clip('pitch-rise.png')
     table.addCommandInput(p, k, 2)
     r = tc.addValueInput('radius%d' % k, 'Radius', lu, radius)
     r.tooltip = 'Distance from the axis at station %d' % k
     r.tooltipDescription = ('Give two stations different radii and the helix tapers '
-                            'between them, like a conical spring.<br><br>Row 1 is set by '
-                            'the start point when there is one, because the radius there '
-                            'is how far that point stands off the axis.')
+                            'between them, like a conical spring.<br><br>Row 1 greys out '
+                            'while you have a start point and Lock radius to start point '
+                            'is ticked, because the radius there is then how far that '
+                            'point stands off the axis. Untick the lock and the row is '
+                            'yours to type again.')
     r.toolClipFilename = _clip('radius.png')
     table.addCommandInput(r, k, 3)
     s = tc.addBoolValueInput('slack%d' % k, 'Sets height', True, '', slack)

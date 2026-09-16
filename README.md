@@ -74,7 +74,11 @@ Any station next to the ticked one carrying the same pitch is worked out along w
 
 Leave the picker empty and the **Height** box is used instead, which is what you want for a height that is a number rather than something already in the model.
 
-**Ends** does what Inventor's coil ends do. Each end is Natural, which starts or finishes at the station as it stands, or Flat, which adds a run at the pitch you give for so many turns and then eases into the station over the transition turns. A pitch of zero is a true flat, which is what a timing screw dwell wants. For a closed spring end give it the wire diameter, or the sweep passes through itself.
+**Ends** does what Inventor's coil ends do. Each end is Natural, which starts or finishes at the station as it stands, or Flat, which adds a run at the pitch you give for so many turns and then eases into the station over the transition turns.
+
+The flat pitch box is the one that catches people out, because Flat is only as flat as the pitch you give it. Zero is the true flat, at right angles to the axis the whole way round, and that is where the box starts. Put a number in it and you get a slow coil instead, so if a flat end still looks like it is climbing, that box is why. The reason to put a number in is a closed spring end: a true flat carried for a whole turn brings the wire back round onto itself, so give it the wire diameter and the coil clears.
+
+Coming from Inventor, the flat and transition runs there are angles, and here they are turns, so divide by 360. A quarter turn is 90 degrees, half a turn is 180. The transition is the run that does the climbing out of a flat end, so it wants the working pitch at station 1 to climb to. Give station 1 some middling pitch instead and the climb spreads over the stations beyond it, which reads as a long ramp rather than an end.
 
 Two jobs it was built for:
 
